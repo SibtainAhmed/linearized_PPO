@@ -112,7 +112,7 @@ class PPOConfig(object):
         default="rough-orig",
         metadata={
             "help": "Type of validation loss to use. Options: 'tracin' or 'ppo'. If 'tracin', the validation loss is calculated using TRACIN. If 'ppo', the validation loss is calculated using PPO."
-        },
+        }, 
     )
     backward_batch_size: Optional[int] = field(
         default=1, metadata={"help": "Number of samples optimized in an `optimizer.step()` call"}
