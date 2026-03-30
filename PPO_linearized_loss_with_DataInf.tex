@@ -1,0 +1,269 @@
+\documentclass{article}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{algorithm,algorithmic}
+\usepackage{booktabs}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\newtheorem{proposition}{Proposition}
+
+\title{Influence Functions for PPO: Linearized Loss Derivation with DataInf}
+\author{Research Notes}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+
+We adapt the linearized loss and DataInf influence function framework---previously developed for GRPO---to Proximal Policy Optimization (PPO) in the RLHF setting.
+The core mathematical machinery (active-mask linearization, the two-gradient trick, Sherman--Morrison inversion, DataInf swap) carries over directly.
+The differences are structural:
+
+\begin{enumerate}
+    \item \textbf{No group structure.} PPO generates a single response per prompt; the batch consists of $N$ independent prompt--response pairs rather than $G_1$ prompts each with a group of $G$ sampled responses.
+    \item \textbf{Advantage computation.} PPO estimates per-token advantages via a learned value function $V_\phi$ and Generalized Advantage Estimation (GAE), replacing the group-relative reward normalization used in GRPO.
+    \item \textbf{Importance ratio baseline.} The clipping ratio is computed against the behavior policy $\pi_{\mathrm{old}}$ (the snapshot used to collect rollouts). When $\pi_{\mathrm{old}} = \pi_{\theta_0}$---i.e., one gradient step per data-collection round---the linearization around $\theta_0$ is exact to first order.
+\end{enumerate}
+
+\section{PPO Loss Formulation}
+
+\subsection{PPO-RLHF Objective}
+
+For a batch of $N$ prompt--response pairs $\{(x_i, o_i)\}_{i=1}^N$, the PPO policy loss is:
+\begin{equation}\label{eq:ppo_loss}
+    \mathcal{L}_{\mathrm{PPO}}
+    = -\frac{1}{N}\sum_{i=1}^{N}\frac{1}{|O_i|}\sum_{t\in O_i}
+      \min\!\bigl(r_{i,t}\,\hat{A}_{i,t},\;
+      \operatorname{clip}(r_{i,t},1{-}\epsilon,1{+}\epsilon)\,\hat{A}_{i,t}\bigr)
+      \;+\;\beta\,D_{\mathrm{KL}}(\pi_\theta\|\pi_{\mathrm{ref}})
+\end{equation}
+where:
+\begin{itemize}
+    \item $r_{i,t} = \pi_\theta(o_{i,t}\mid o_{i,<t})\,/\,\pi_{\mathrm{old}}(o_{i,t}\mid o_{i,<t})$ is the importance ratio w.r.t.\ the behavior policy,
+    \item $\hat{A}_{i,t}$ is the GAE advantage (defined below),
+    \item $\beta\ge0$ is an optional KL penalty coefficient against a fixed reference policy $\pi_{\mathrm{ref}}$ (e.g., the SFT checkpoint).
+\end{itemize}
+
+\paragraph{Advantage via GAE.}
+Let $r_{i,t}^{\mathrm{rew}}$ denote the per-token reward signal and $V_\phi$ a learned value function.
+Define TD residuals and GAE advantages:
+\begin{equation}\label{eq:gae}
+    \delta_{i,t} = r_{i,t}^{\mathrm{rew}} + \gamma\,V_\phi(s_{i,t+1}) - V_\phi(s_{i,t}),
+    \qquad
+    \hat{A}_{i,t} = \sum_{\ell=0}^{T_i - t}(\gamma\lambda_{\mathrm{GAE}})^\ell\,\delta_{i,t+\ell}
+\end{equation}
+In typical RLHF, $r_{i,t}^{\mathrm{rew}}=0$ for $t<T_i$ and $r_{i,T_i}^{\mathrm{rew}} = R_{\mathrm{RM}}(x_i,o_i)$.
+
+\paragraph{Remark (KL placement).}
+Some implementations fold the KL penalty into the reward as $r_{i,t}^{\mathrm{rew}} \mathrel{{-}{=}} \beta\log\bigl(\pi_\theta(o_{i,t}\mid o_{i,<t})/\pi_{\mathrm{ref}}(o_{i,t}\mid o_{i,<t})\bigr)$, in which case GAE advantages already account for KL and the separate $\beta D_{\mathrm{KL}}$ term in \eqref{eq:ppo_loss} is absent (equivalently, $\beta=0$ in the loss).
+Our derivation covers both cases: when KL is a separate loss term, the $\beta$ appears explicitly in the effective weight; when KL is in the reward, set $\beta=0$ and the advantage already encodes the KL effect.
+
+\subsection{Linearization}
+
+The linearization follows the same three steps as the GRPO derivation. We summarize the result; full justifications are identical.
+
+\paragraph{Step 1: Active mask.}
+Define the mask $m_{i,t}\in\{0,1\}$ that selects tokens where the unclipped ratio is active:
+\begin{equation}
+    m_{i,t} = \begin{cases}
+        1 & \text{if } \hat{A}_{i,t}\ge 0 \text{ and } r_{i,t}\le 1+\epsilon,\\
+        1 & \text{if } \hat{A}_{i,t}< 0 \text{ and } r_{i,t}\ge 1-\epsilon,\\
+        0 & \text{otherwise.}
+    \end{cases}
+\end{equation}
+When $m_{i,t}=0$ the clipped ratio is used, which is locally constant in $\theta$; hence the clipped branch contributes zero gradient and can be dropped.
+
+\paragraph{Step 2: Taylor expansion.}
+With $\pi_{\mathrm{old}}=\pi_{\theta_0}$ and a first-order expansion of $\log\pi_\theta$ around $\theta_0$:
+\begin{equation}
+    \log r_{i,t}
+    = \log\pi_\theta(o_{i,t}\mid o_{i,<t}) - \log\pi_{\theta_0}(o_{i,t}\mid o_{i,<t})
+    \approx \nabla_\theta\log\pi_\theta\big|_{\theta_0}\!\cdot(\theta-\theta_0)
+    =: \Delta_{i,t}
+\end{equation}
+so $r_{i,t}\approx 1+\Delta_{i,t}$, and each active term $m_{i,t}\,r_{i,t}\,\hat{A}_{i,t}$ becomes $m_{i,t}(\hat{A}_{i,t}+\hat{A}_{i,t}\Delta_{i,t})$.
+
+\paragraph{Step 3: KL linearization.}
+Using the same first-order expansion, the per-token KL estimate $\log(\pi_\theta/\pi_{\mathrm{ref}})$ linearizes to $\log\pi_\theta + \mathrm{const}_\theta$, since $\log\pi_{\mathrm{ref}}$ is independent of $\theta$.
+
+\paragraph{Linearized PPO loss.}
+Combining and dropping $\theta$-independent constants:
+\begin{equation}\label{eq:linearized_ppo}
+\boxed{
+    \mathcal{L}_{\mathrm{PPO}}
+    \approx -\frac{1}{N}\sum_{i=1}^{N}\frac{1}{|O_i|}\sum_{t}
+    \bigl(m_{i,t}\,\hat{A}_{i,t} - \beta\bigr)\,\log\pi_\theta(o_{i,t}\mid o_{<t})
+    \;+\;\mathrm{const}_\theta
+}
+\end{equation}
+
+Define the effective per-token weight:
+\begin{equation}\label{eq:weight}
+    w_{i,t} = \frac{m_{i,t}\,\hat{A}_{i,t} - \beta}{N\,|O_i|}
+\end{equation}
+so that $\mathcal{L}_{\mathrm{PPO}} = -\sum_i\sum_t w_{i,t}\,\log\pi_\theta(o_{i,t}\mid o_{<t})$.
+
+\paragraph{Key difference from GRPO.}
+In GRPO, $\hat{A}_{i,t}$ is constant across all tokens in a response (it is a response-level normalized reward).
+In PPO with GAE, $\hat{A}_{i,t}$ varies per token, so the weights $w_{i,t}$ exhibit richer token-level structure.
+The summation is also simpler: $N$ samples instead of $G_1$ groups $\times$ $G$ responses.
+
+\section{Per-Sample Gradient and Empirical Hessian}
+
+From here, the algebra is structurally identical to the GRPO case with $N$ replacing $G_1$ and PPO's per-token $w_{i,t}$ replacing GRPO's response-level weight; we state the results.
+
+\subsection{Per-Sample Gradient}
+
+For layer $l$:
+\begin{equation}
+    g_{i,l} = -\sum_t w_{i,t}\,\nabla_{\theta_l}\log\pi_\theta(o_{i,t}\mid o_{<t})
+\end{equation}
+
+\subsection{Linear-Weight Hessian via the Two-Gradient Trick}
+
+A naive outer product $g_{i,l}g_{i,l}^T$ yields squared weights $w_{i,t}^2$, which distorts the Hessian.
+The two-gradient trick (detailed in the GRPO derivation) constructs a modified gradient:
+\begin{equation}\label{eq:g1}
+    g_{1,i,l} = \sum_t \sqrt{w_{i,t}+c}\;\nabla_{\theta_l}\log\pi_\theta(o_{i,t}\mid o_{<t})
+\end{equation}
+where $c = \epsilon_c\cdot\max_{i,t}|w_{i,t}|$ with $\epsilon_c\in[0.01,0.1]$ ensures $w_{i,t}+c>0$.
+
+Using token-level gradient independence to drop cross-terms ($t\neq s$), the rank-one practical approximation gives:
+\begin{equation}
+    \tilde{G}_{i,l}
+    := g_{1,i,l}\,g_{1,i,l}^T
+    \approx \sum_t (w_{i,t}+c)\,
+    \nabla_{\theta_l}\log\pi_\theta(o_{i,t})\,
+    \nabla_{\theta_l}\log\pi_\theta(o_{i,t})^T
+\end{equation}
+yielding approximately linear weights $(w_{i,t}+c)\approx w_{i,t}$ for small $c$, with the same justifications and trade-offs as in the GRPO derivation (computational feasibility of rank-one form, uniform bias absorbed by damping).
+
+\section{DataInf Influence Computation}
+
+\subsection{Per-Sample Matrix and Sherman--Morrison Inversion}
+
+\begin{equation}
+    M_{i,l} = g_{1,i,l}\,g_{1,i,l}^T + \lambda_l\,I
+\end{equation}
+
+\begin{proposition}[Sherman--Morrison]
+$\displaystyle
+    M_{i,l}^{-1}
+    = \frac{1}{\lambda_l}\!\left(I - \frac{g_{1,i,l}\,g_{1,i,l}^T}{\lambda_l + \|g_{1,i,l}\|^2}\right)
+$
+\end{proposition}
+
+Adaptive damping $\lambda_l$ is chosen as in the GRPO derivation to ensure positive definiteness.
+
+\subsection{DataInf Swap and Influence Score}
+
+Applying the DataInf swap $\bigl(\frac{1}{N}\sum_i M_{i,l}\bigr)^{-1}\approx\frac{1}{N}\sum_i M_{i,l}^{-1}$ and substituting Sherman--Morrison, the influence of training sample $k$ on a validation loss $\ell_{\mathrm{val}}$ with gradient $v_l=\nabla_{\theta_l}\ell_{\mathrm{val}}$ is:
+
+\begin{equation}\label{eq:influence}
+\boxed{
+    \mathcal{I}(k)
+    = \sum_{l=1}^{L}\frac{1}{\lambda_l}
+    \left[
+      \frac{1}{N}\sum_{i=1}^{N}
+      \frac{L_{l,i}\,L_{l,ik}}{\lambda_l + L_{l,ii}}
+      \;-\; L_{l,k}
+    \right]
+}
+\end{equation}
+where:
+\begin{itemize}
+    \item $L_{l,i} = v_l^T\,g_{1,i,l}$ \;\;(test--train alignment),
+    \item $L_{l,ik} = g_{1,i,l}^T\,g_{1,k,l}$ \;\;(train--train similarity),
+    \item $L_{l,ii} = \|g_{1,i,l}\|^2$ \;\;(gradient magnitude),
+    \item $L_{l,k} = v_l^T\,g_{1,k,l}$ \;\;(test--target alignment).
+\end{itemize}
+
+The formula is identical in structure to the GRPO influence score; only the contents of $g_{1,i,l}$ differ through the PPO-specific weights $w_{i,t}$.
+
+\section{Implementation Algorithm}
+
+\begin{algorithm}[H]
+\caption{Influence Computation for Linearized PPO}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} Policy $\pi_\theta$, value function $V_\phi$, training data $\{(x_i,o_i)\}_{i=1}^N$, validation sample $(x_{\mathrm{val}},o_{\mathrm{val}})$
+\STATE \textbf{Output:} Influence scores $\{\mathcal{I}(k)\}_{k=1}^N$
+
+\STATE \textbf{// Step 1: Compute advantages and effective weights}
+\FOR{$i=1$ to $N$}
+    \STATE Compute GAE advantages $\hat{A}_{i,t}$ via Eq.~\eqref{eq:gae}
+    \STATE Evaluate active mask $m_{i,t}$ at current $r_{i,t}$
+    \STATE $w_{i,t} \leftarrow (m_{i,t}\,\hat{A}_{i,t} - \beta)\,/\,(N\,|O_i|)$
+\ENDFOR
+\STATE $c \leftarrow \epsilon_c \cdot \max_{i,t}|w_{i,t}|$
+
+\STATE \textbf{// Step 2: Compute modified training gradients (one backprop per sample)}
+\FOR{$i=1$ to $N$}
+    \FOR{each layer $l$}
+        \STATE $g_{1,i,l} \leftarrow \sum_t \sqrt{w_{i,t}+c}\;\nabla_{\theta_l}\log\pi_\theta(o_{i,t}\mid o_{<t})$
+    \ENDFOR
+\ENDFOR
+
+\STATE \textbf{// Step 3: Compute validation gradient}
+\FOR{each layer $l$}
+    \STATE $v_l \leftarrow \nabla_{\theta_l}\ell_{\mathrm{val}}$
+    \STATE Compute adaptive damping $\lambda_l$
+\ENDFOR
+
+\STATE \textbf{// Step 4: Compute influence scores via scalar products}
+\FOR{$k=1$ to $N$}
+    \STATE $\mathcal{I}(k) \leftarrow 0$
+    \FOR{each layer $l$}
+        \STATE $L_{l,k} \leftarrow v_l^T\,g_{1,k,l}$
+        \STATE $\mathrm{sum} \leftarrow 0$
+        \FOR{$i=1$ to $N$}
+            \STATE $L_{l,i} \leftarrow v_l^T\,g_{1,i,l}$;\quad
+                   $L_{l,ik} \leftarrow g_{1,i,l}^T\,g_{1,k,l}$;\quad
+                   $L_{l,ii} \leftarrow \|g_{1,i,l}\|^2$
+            \STATE $\mathrm{sum} \leftarrow \mathrm{sum} + L_{l,i}\,L_{l,ik}\,/\,(\lambda_l + L_{l,ii})$
+        \ENDFOR
+        \STATE $\mathcal{I}(k) \leftarrow \mathcal{I}(k) + \frac{1}{\lambda_l}\bigl[\frac{1}{N}\,\mathrm{sum} - L_{l,k}\bigr]$
+    \ENDFOR
+\ENDFOR
+\STATE \textbf{return} $\{\mathcal{I}(k)\}_{k=1}^N$
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Computational cost:} Only $N$ backpropagations are needed (one per training sample), compared to $N\times G$ for GRPO where $G$ responses are generated per prompt.
+
+\section{Comparison with GRPO}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Aspect} & \textbf{GRPO} & \textbf{PPO} \\
+\midrule
+Batch structure & $G_1$ prompts $\times$ $G$ responses & $N$ prompt--response pairs \\
+Advantage & $\hat{A}_i = \frac{R_i - \mu_G}{\sigma_G}$ (response-level) & $\hat{A}_{i,t}$ via GAE (token-level) \\
+Value function & Not needed & Learned $V_\phi$ required \\
+Ratio denominator & $\pi_{\mathrm{ref}}$ & $\pi_{\mathrm{old}}$ \\
+Weight variation & Constant across tokens in a response & Varies per token \\
+Effective weight & $w_{i,t} = \frac{m_{i,t}\hat{A}_i - \beta}{G_1|O_i|}$ & $w_{i,t} = \frac{m_{i,t}\hat{A}_{i,t} - \beta}{N|O_i|}$ \\
+Backprops & $N \times G$ (one per response) & $N$ (one per sample) \\
+\midrule
+\multicolumn{3}{l}{\textit{Shared:} Linearization, two-gradient trick, Sherman--Morrison, DataInf formula} \\
+\bottomrule
+\end{tabular}
+\caption{Structural comparison of the linearized influence derivation for GRPO vs.\ PPO.}
+\end{table}
+
+\section{Summary}
+
+The linearized PPO loss with DataInf influence functions follows the same five-step recipe as GRPO:
+\begin{enumerate}
+    \item \textbf{Linearize} the clipped surrogate via active masking and first-order Taylor expansion.
+    \item \textbf{Define effective weights} $w_{i,t}$ incorporating advantages, KL penalty, and mask.
+    \item \textbf{Construct modified gradients} $g_{1,i,l}$ with $\sqrt{w_{i,t}+c}$ coefficients for linear Hessian weights.
+    \item \textbf{Invert} the per-sample Hessian approximation via Sherman--Morrison ($O(d)$ per sample).
+    \item \textbf{Compute influence} via the DataInf swap in closed form using scalar products.
+\end{enumerate}
+The only changes from GRPO are the absence of group structure (simpler summation over $N$ samples), per-token GAE advantages in place of response-level normalized rewards, and the use of the behavior policy $\pi_{\mathrm{old}}$ as the ratio baseline.
+
+\end{document}
