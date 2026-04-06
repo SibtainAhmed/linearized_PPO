@@ -3598,6 +3598,13 @@ class PPOTrainer(BaseTrainer):
                 step=self.current_step if self.config.log_with == "tensorboard" else None,
             )
 
+            if self.config.log_with == "wandb":
+                import wandb
+                influence_logs = {k: v for k, v in stats.items()
+                                  if "iif/" in k or "datainf/" in k}
+                if influence_logs:
+                    wandb.log(influence_logs)
+
         else:
             if self.is_distributed:
                 import torch.distributed as dist
