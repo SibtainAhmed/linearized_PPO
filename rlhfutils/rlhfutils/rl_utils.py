@@ -77,8 +77,6 @@ class ScriptArguments:
     target_kl: Optional[float] = field(default=0.1, metadata={"help": "kl target for early stopping"})
     sanity_check: Optional[bool] = field(default=False, metadata={"help": "whether to do a sanity check"})
     tracin: Optional[bool] = field(default=False, metadata={"help": "whether to use tracin for reselection"})
-    datainf: Optional[bool] = field(default=False, metadata={"help": "whether to use DataInf influence function for sample selection"})
-    datainf_eps_c: Optional[float] = field(default=0.05, metadata={"help": "epsilon_c for DataInf modified gradient constant c"})
     load_in_8bit: Optional[bool] = field(default=False, metadata={"help": "whether to load in 8 bit"})
     with_validation: Optional[bool] = field(default=False, metadata={"help": "whether to use validation"})
     reward_source: Optional[str] = field(default="rm", metadata={"help": "the reward source"})
@@ -1594,95 +1592,6 @@ def train_loop_with_validation(script_args, ppo_trainer, reward_model, tokenizer
         if script_args.save_freq and (epoch+1) % script_args.save_freq == 0:
             ppo_trainer.save_pretrained(script_args.output_dir + f"step_{epoch+1}")
         
-def train_loop_datainf(script_args, ppo_trainer, reward_model, tokenizer, qaform, min_length=20, val_question_tensors=None, val_questions=None, reward_tokenizer=None):
-
-    generation_kwargs = { 
-        "min_length": min_length, "top_k": 0.0,"top_p": 1, "do_sample": True, "temperature":script_args.temperature
-    }
-    sjson = {'intervals':[100000]}
-    if script_args.generators_json !=None:
-        with open(script_args.generators_json) as f:
-            sjson = json.load(f)
-            
-    current_device = Accelerator().local_process_index
-    
-    print(reward_model, " is RM")
-        
-    min_len = script_args.max_length-2
-    output_length_sampler = LengthSampler(min_len, script_args.max_length)
-
-    running_means = []
-    rmname = script_args.reward_model_name
-    
-    curstrat = -1
-    tmpmodel = None
-    ratio = 0
-    ppo_trainer.save_pretrained(script_args.output_dir + f"step_0")
-    for epoch, batch in tqdm(enumerate(ppo_trainer.dataloader)):
-        if sjson['intervals'][curstrat+1]<epoch:
-            curstrat+=1
-            if sjson['checkpoints'][curstrat]!='orig':
-                get_unwrapped(ppo_trainer).load_adapter(sjson['checkpoints'][curstrat], sjson['checkpoints'][curstrat], is_trainable=False)
-                get_unwrapped(ppo_trainer).to(current_device)
-            ratio = sjson['ratios'][curstrat]
-            tmpmodel = sjson['checkpoints'][curstrat]
-        if epoch >= script_args.steps:
-            break
-        
-        question_tensors = batch["input_ids"]
-        
-        if epoch == 0:
-            print("PPO input")
-            print(tokenizer.batch_decode(question_tensors, skip_special_tokens=True))
-        
-        timing = dict()
-        t = time.time()
-        with torch.no_grad():
-            response_tensors, kl_mask = get_rollouts(ppo_trainer, question_tensors, output_length_sampler, script_args, generation_kwargs, tmpmodel, abs(ratio))
-            val_response_tensors, val_kl_mask = get_rollouts(ppo_trainer, val_question_tensors, output_length_sampler, script_args, generation_kwargs, tmpmodel, abs(ratio))
-        timing["time/ppo/sample_generation"] = time.time() - t
-            
-        batch["response"] = tokenizer.batch_decode(response_tensors, skip_special_tokens=True)
-        
-        if epoch == 0:
-            print("QAForm Input Example:")
-            print(qaform(batch['query'][0], batch['response'][0]))
-
-        val_responses = tokenizer.batch_decode(val_response_tensors, skip_special_tokens=True)
-        
-        t = time.time()
-        if 'hate' in rmname:
-            rewards = process_reward(batch["response"], rmname, reward_model, script_args, response_tensors, batch, reward_tokenizer)
-            val_rewards = process_reward(val_responses, rmname, reward_model, script_args, val_response_tensors, batch, reward_tokenizer)        
-        else:            
-            texts = [qaform(q, r) for q, r in zip(batch["query"], batch["response"])]
-            val_texts = [qaform(q, r) for q, r in zip(val_questions, val_responses)]
-            rewards = process_reward(texts, rmname, reward_model, script_args, response_tensors, batch, reward_tokenizer)
-            val_rewards = process_reward(val_texts, rmname, reward_model, script_args, val_response_tensors, batch, reward_tokenizer)        
-        timing["time/ppo/sample_scoring"] = time.time() - t
-
-        keep_inds = list(range(len(rewards)))
-        
-        print("RM MEAN", mean(rewards))
-        rewards = [torch.tensor(r).to(current_device) for r in rewards]
-        val_rewards = [torch.tensor(r).to(current_device) for r in val_rewards]
-        
-        rws = [float(f) for f in rewards]
-        running_means.append(mean(rws))
-        
-        logrewards = [float(r.item()) for r in rewards]
-                            
-        stats = ppo_trainer.step_datainf(
-            question_tensors, response_tensors, rewards, 
-            val_question_tensors, val_response_tensors, val_rewards,
-            timing, gen_data_dir=script_args.gen_data_dir,
-            datainf_eps_c=script_args.datainf_eps_c)
-        
-        ppo_trainer.log_stats(stats, batch, logrewards)
-        print(f"DataInf step {epoch} complete")
-        if script_args.save_freq and (epoch+1) % script_args.save_freq == 0:
-            ppo_trainer.save_pretrained(script_args.output_dir + f"step_{epoch+1}")
-
 def diagnose_with_validation(script_args, ppo_trainer, tokenizer, 
                              train_samples, 
                              val_ds, val_question_tensors, val_response_tensors,
