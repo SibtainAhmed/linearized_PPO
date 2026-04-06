@@ -1376,6 +1376,14 @@ class PPOTrainer(BaseTrainer):
         # selected_ids = np.random.choice(np.arange(len(ghost_ip)), size=int(len(ghost_ip) / 2), replace=False)
 
         print('#selected ids', len(selected_ids))
+
+        if self.config.log_with == "wandb":
+            import wandb
+            wandb.log({
+                "ppo/iif/n_selected": float(len(selected_ids)),
+                "ppo/iif/n_total": float(bs),
+                "ppo/iif/selection_ratio": float(len(selected_ids)) / float(bs),
+            })
         
         # save the queries, responses, rewards, advantages, IP scores to a dataframe
 
@@ -1938,6 +1946,14 @@ class PPOTrainer(BaseTrainer):
         # selected_ids = np.random.choice(np.arange(len(ghost_ip)), size=int(len(ghost_ip) / 2), replace=False)
 
         print('#selected ids', len(selected_ids))
+
+        if self.config.log_with == "wandb":
+            import wandb
+            wandb.log({
+                "ppo/iif/n_selected": float(len(selected_ids)),
+                "ppo/iif/n_total": float(bs),
+                "ppo/iif/selection_ratio": float(len(selected_ids)) / float(bs),
+            })
         
         for k in batch_dict.keys():
             if len(batch_dict[k]) < bs:
@@ -3597,13 +3613,6 @@ class PPOTrainer(BaseTrainer):
                 logs,
                 step=self.current_step if self.config.log_with == "tensorboard" else None,
             )
-
-            if self.config.log_with == "wandb":
-                import wandb
-                influence_logs = {k: v for k, v in stats.items()
-                                  if "iif/" in k}
-                if influence_logs:
-                    wandb.log(influence_logs)
 
         else:
             if self.is_distributed:
