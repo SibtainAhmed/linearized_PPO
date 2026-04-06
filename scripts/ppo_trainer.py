@@ -1226,7 +1226,7 @@ class PPOTrainer(BaseTrainer):
         self.accelerator.backward(validation_loss)
         self._record_ghost = False
         self.optimizer.zero_grad()
-        
+        # Influence Score Calculation
         ghost_ip = self.compute_ghost_inner_product_matrix_op()
         print("Ghost gradient inner product:", ghost_ip)
         
@@ -1380,9 +1380,9 @@ class PPOTrainer(BaseTrainer):
         if self.config.log_with == "wandb":
             import wandb
             wandb.log({
-                "ppo/iif/n_selected": float(len(selected_ids)),
-                "ppo/iif/n_total": float(bs),
-                "ppo/iif/selection_ratio": float(len(selected_ids)) / float(bs),
+                "influence/n_selected": float(len(selected_ids)),
+                "influence/n_total": float(bs),
+                "influence/selection_ratio": float(len(selected_ids)) / float(bs),
             })
         
         # save the queries, responses, rewards, advantages, IP scores to a dataframe
@@ -1927,7 +1927,7 @@ class PPOTrainer(BaseTrainer):
         self.save_cnt += 1
         
         t = time.time()
-        
+        # Influence Score Selection
         # drop samples with negative influence
         selected_ids = np.where(np.array(ghost_ip) > 0)[0]
         
@@ -1950,9 +1950,9 @@ class PPOTrainer(BaseTrainer):
         if self.config.log_with == "wandb":
             import wandb
             wandb.log({
-                "ppo/iif/n_selected": float(len(selected_ids)),
-                "ppo/iif/n_total": float(bs),
-                "ppo/iif/selection_ratio": float(len(selected_ids)) / float(bs),
+                "influence/n_selected": float(len(selected_ids)),
+                "influence/n_total": float(bs),
+                "influence/selection_ratio": float(len(selected_ids)) / float(bs),
             })
         
         for k in batch_dict.keys():
