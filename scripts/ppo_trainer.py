@@ -1488,6 +1488,9 @@ class PPOTrainer(BaseTrainer):
         stats = stats_to_np(stats)
         timing["time/ppo/calc_stats"] = time.time() - t
         stats["ppo/learning_rate"] = self.optimizer.param_groups[0]["lr"]
+        stats["ppo/influence/n_selected"] = len(selected_ids)
+        stats["ppo/influence/n_total"] = bs
+        stats["ppo/influence/selection_ratio"] = len(selected_ids) / bs
 
         # Update the KL control - multiply the batch_size by the number of processes
         self.kl_ctl.update(
@@ -2037,6 +2040,9 @@ class PPOTrainer(BaseTrainer):
         stats = stats_to_np(stats)
         timing["time/ppo/calc_stats"] = time.time() - t
         stats["ppo/learning_rate"] = self.optimizer.param_groups[0]["lr"]
+        stats["ppo/influence/n_selected"] = len(selected_ids)
+        stats["ppo/influence/n_total"] = bs
+        stats["ppo/influence/selection_ratio"] = len(selected_ids) / bs
 
         # Update the KL control - multiply the batch_size by the number of processes
         self.kl_ctl.update(
@@ -2434,6 +2440,9 @@ class PPOTrainer(BaseTrainer):
             stats.update(timing)
             stats["ppo/datainf/n_selected"] = 0
             stats["ppo/datainf/n_total"] = bs
+            stats["ppo/influence/n_selected"] = 0
+            stats["ppo/influence/n_total"] = bs
+            stats["ppo/influence/selection_ratio"] = 0.0
             return stats
 
         train_stats = stack_dicts(all_stats)
@@ -2461,6 +2470,9 @@ class PPOTrainer(BaseTrainer):
         stats["ppo/datainf/n_selected"] = len(selected_ids)
         stats["ppo/datainf/n_total"] = bs
         stats["ppo/datainf/c"] = c
+        stats["ppo/influence/n_selected"] = len(selected_ids)
+        stats["ppo/influence/n_total"] = bs
+        stats["ppo/influence/selection_ratio"] = len(selected_ids) / bs
 
         self.kl_ctl.update(
             stats["objective/kl"],
@@ -3133,6 +3145,9 @@ class PPOTrainer(BaseTrainer):
         stats = stats_to_np(stats)
         timing["time/ppo/calc_stats"] = time.time() - t
         stats["ppo/learning_rate"] = self.optimizer.param_groups[0]["lr"]
+        stats["ppo/influence/n_selected"] = len(selected_ids)
+        stats["ppo/influence/n_total"] = bs
+        stats["ppo/influence/selection_ratio"] = len(selected_ids) / bs
 
         # Update the KL control - multiply the batch_size by the number of processes
         self.kl_ctl.update(
