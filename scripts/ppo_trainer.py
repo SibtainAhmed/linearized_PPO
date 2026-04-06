@@ -3601,7 +3601,7 @@ class PPOTrainer(BaseTrainer):
             if self.config.log_with == "wandb":
                 import wandb
                 influence_logs = {k: v for k, v in stats.items()
-                                  if "iif/" in k or "datainf/" in k}
+                                  if "iif/" in k}
                 if influence_logs:
                     wandb.log(influence_logs)
 
