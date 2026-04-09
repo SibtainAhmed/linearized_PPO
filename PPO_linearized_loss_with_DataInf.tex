@@ -18,12 +18,12 @@
 \section{Introduction}
 
 We adapt the linearized loss and DataInf influence function framework---previously developed for GRPO---to Proximal Policy Optimization (PPO) in the RLHF setting.
-The core mathematical machinery (active-mask linearization, the two-gradient trick, Sherman--Morrison inversion, DataInf swap) carries over directly.
+The core mathematical machinery (active-mask linearization, modified gradient approximation, Sherman--Morrison inversion, DataInf swap) carries over directly.
 The differences are structural:
 
 \begin{enumerate}
     \item \textbf{No group structure.} PPO generates a single response per prompt; the batch consists of $N$ independent prompt--response pairs rather than $G_1$ prompts each with a group of $G$ sampled responses.
-    \item \textbf{Advantage computation.} PPO estimates per-token advantages via a learned value function $V_\phi$ and Generalized Advantage Estimation (GAE), replacing the group-relative reward normalization used in GRPO.
+    \item \textbf{Advantage computation.} PPO computes a per-sample advantage $\hat{A}_i$ via a learned value function $V_\phi$ (e.g., the reward model score $R_{\mathrm{RM}}(x_i,o_i)$, or a summary statistic of GAE values over response tokens), replacing the group-relative reward normalization used in GRPO.
     \item \textbf{Importance ratio baseline.} The clipping ratio is computed against the behavior policy $\pi_{\mathrm{old}}$ (the snapshot used to collect rollouts). When $\pi_{\mathrm{old}} = \pi_{\theta_0}$---i.e., one gradient step per data-collection round---the linearization around $\theta_0$ is exact to first order.
 \end{enumerate}
 
@@ -89,150 +89,395 @@ so $r_{i,t}\approx 1+\Delta_{i,t}$, and each active term $m_{i,t}\,r_{i,t}\,\hat
 Using the same first-order expansion, the per-token KL estimate $\log(\pi_\theta/\pi_{\mathrm{ref}})$ linearizes to $\log\pi_\theta + \mathrm{const}_\theta$, since $\log\pi_{\mathrm{ref}}$ is independent of $\theta$.
 
 \paragraph{Linearized PPO loss.}
-Combining and dropping $\theta$-independent constants:
+Combining and dropping $\theta$-independent constants, and adopting a per-sample (response-level) advantage $\hat{A}_i$ and active indicator $m_i \in \{0,1\}$:
 \begin{equation}\label{eq:linearized_ppo}
 \boxed{
     \mathcal{L}_{\mathrm{PPO}}
-    \approx -\frac{1}{N}\sum_{i=1}^{N}\frac{1}{|O_i|}\sum_{t}
-    \bigl(m_{i,t}\,\hat{A}_{i,t} - \beta\bigr)\,\log\pi_\theta(o_{i,t}\mid o_{<t})
+    \approx -\frac{1}{N}\sum_{i=1}^{N}
+    (m_i\,\hat{A}_i - \beta)\,\log\pi_\theta(o_i\mid x_i)
     \;+\;\mathrm{const}_\theta
 }
 \end{equation}
+where $\log\pi_\theta(o_i\mid x_i) = \sum_t \log\pi_\theta(o_{i,t}\mid o_{i,<t})$ is the response log-likelihood, $m_i$ is the per-sample active indicator (whether the response lies in the unclipped region), and $\hat{A}_i$ is the per-sample advantage.
 
-Define the effective per-token weight:
+Define the effective per-sample weight:
 \begin{equation}\label{eq:weight}
-    w_{i,t} = \frac{m_{i,t}\,\hat{A}_{i,t} - \beta}{N\,|O_i|}
+    w_i = \frac{m_i\,\hat{A}_i - \beta}{N}
 \end{equation}
-so that $\mathcal{L}_{\mathrm{PPO}} = -\sum_i\sum_t w_{i,t}\,\log\pi_\theta(o_{i,t}\mid o_{<t})$.
+so that $\mathcal{L}_{\mathrm{PPO}} = -\sum_i w_i\,\log\pi_\theta(o_i\mid x_i)$.
 
 \paragraph{Key difference from GRPO.}
-In GRPO, $\hat{A}_{i,t}$ is constant across all tokens in a response (it is a response-level normalized reward).
-In PPO with GAE, $\hat{A}_{i,t}$ varies per token, so the weights $w_{i,t}$ exhibit richer token-level structure.
-The summation is also simpler: $N$ samples instead of $G_1$ groups $\times$ $G$ responses.
+In GRPO, $\hat{A}_i$ is the group-relative normalized reward (computed across $G$ responses to the same prompt).
+In PPO, $\hat{A}_i$ is obtained from a learned value function (e.g., via the RM score or GAE), and there is no group structure: the batch contains $N$ independent prompt--response pairs.
 
+%% ========================================================================
 \section{Per-Sample Gradient and Empirical Hessian}
+%% ========================================================================
 
-From here, the algebra is structurally identical to the GRPO case with $N$ replacing $G_1$ and PPO's per-token $w_{i,t}$ replacing GRPO's response-level weight; we state the results.
+\subsection{Per-Sample Loss Gradient}
 
-\subsection{Per-Sample Gradient}
+The linearized per-sample loss is $\ell_i = -w_i\,\log\pi_\theta(o_i\mid x_i)$.
+For layer $l$ with parameters $\theta_l$, the \textbf{actual loss gradient} is:
+\begin{equation}\label{eq:loss_grad}
+    g_{i,l} = \nabla_{\theta_l}\ell_i = -w_i\,\nabla_{\theta_l}\log\pi_\theta(o_i\mid x_i)
+\end{equation}
+where $\nabla_{\theta_l}\log\pi_\theta(o_i\mid x_i) = \sum_t \nabla_{\theta_l}\log\pi_\theta(o_{i,t}\mid o_{i,<t})$ is the response-level gradient.
 
-For layer $l$:
+The scalar coefficient $w_i$ can be positive or negative depending on the sign of $m_i\hat{A}_i - \beta$.
+
+\subsection{The Squared-Weight Problem}
+
+The naive Gauss--Newton / empirical Fisher approximation to the Hessian uses per-sample outer products:
 \begin{equation}
-    g_{i,l} = -\sum_t w_{i,t}\,\nabla_{\theta_l}\log\pi_\theta(o_{i,t}\mid o_{<t})
+    H_l^{\mathrm{naive}} = \frac{1}{N}\sum_{i=1}^N g_{i,l}\,g_{i,l}^T
 \end{equation}
 
-\subsection{Linear-Weight Hessian via the Two-Gradient Trick}
+Since $g_{i,l} = -w_i\,\nabla_{\theta_l}\log\pi_\theta(o_i\mid x_i)$, the outer product $g_{i,l}\,g_{i,l}^T = w_i^2\,(\nabla_{\theta_l}\log\pi_\theta(o_i\mid x_i))(\nabla_{\theta_l}\log\pi_\theta(o_i\mid x_i))^T$ produces a \textbf{squared weight} $w_i^2$ rather than the desired linear weight $w_i$, distorting the curvature information used in influence computation.
 
-A naive outer product $g_{i,l}g_{i,l}^T$ yields squared weights $w_{i,t}^2$, which distorts the Hessian.
-The two-gradient trick (detailed in the GRPO derivation) constructs a modified gradient:
-\begin{equation}\label{eq:g1}
-    g_{1,i,l} = \sum_t \sqrt{w_{i,t}+c}\;\nabla_{\theta_l}\log\pi_\theta(o_{i,t}\mid o_{<t})
+\subsection{Modified Gradient Approximation}\label{sec:modified_grad}
+
+To recover approximately linear weights while maintaining computational tractability, we define a \emph{modified gradient} per sample:
+\begin{equation}\label{eq:modified_grad}
+    \tilde{g}_{i,l} = \sqrt{w_i+c}\;\nabla_{\theta_l}\log\pi_\theta(o_i\mid x_i)
 \end{equation}
-where $c = \epsilon_c\cdot\max_{i,t}|w_{i,t}|$ with $\epsilon_c\in[0.01,0.1]$ ensures $w_{i,t}+c>0$.
 
-Using token-level gradient independence to drop cross-terms ($t\neq s$), the rank-one practical approximation gives:
+\paragraph{Computing the shift constant $c$.}
+The constant $c$ must satisfy $w_i + c > 0$ for all samples contributing to the Hessian (so the square root is real-valued).
+A naive choice $c = \max(0,-\min_i w_i)+\varepsilon$ is vulnerable to outliers: a single sample with an extreme negative weight forces $c$ to be large, uniformly inflating every other sample's contribution and distorting the Hessian.
+
+Instead, we use a \emph{percentile-clipped} shift based on the $p$-th percentile of the batch weights (e.g., $p=5$):
+\begin{equation}\label{eq:c_formula}
+    c = \max\!\bigl(0,\;-Q_p\bigl(\{w_i\}_{i=1}^N\bigr)\bigr) + \varepsilon
+\end{equation}
+where $Q_p(\{w_i\})$ is the $p$-th percentile of $\{w_i\}$ and $\varepsilon>0$ (e.g., $\varepsilon=10^{-8}$) ensures strict positivity.
+Any sample with $w_i < Q_p$ is excluded from the Hessian construction (its rank-one contribution $\tilde{G}_{i,l}$ is dropped), so the effective Hessian is built from $N^* \approx (1-p/100)\,N$ samples.
+For all retained samples, $w_i \ge Q_p$ and therefore $w_i + c > 0$.
+
+When all weights are non-negative ($Q_p \ge 0$), the shift reduces to $c = \varepsilon \approx 0$ and the bias is negligible.
+
+\paragraph{Rank-one Hessian contribution.}
+The per-sample Hessian contribution is approximated by the rank-one outer product:
 \begin{equation}
-    \tilde{G}_{i,l}
-    := g_{1,i,l}\,g_{1,i,l}^T
-    \approx \sum_t (w_{i,t}+c)\,
-    \nabla_{\theta_l}\log\pi_\theta(o_{i,t})\,
-    \nabla_{\theta_l}\log\pi_\theta(o_{i,t})^T
+    \tilde{G}_{i,l} := \tilde{g}_{i,l}\,\tilde{g}_{i,l}^T = (w_i+c)\,\nabla_{\theta_l}\log\pi_\theta(o_i\!\mid\! x_i)\,\nabla_{\theta_l}\log\pi_\theta(o_i\!\mid\! x_i)^T
 \end{equation}
-yielding approximately linear weights $(w_{i,t}+c)\approx w_{i,t}$ for small $c$, with the same justifications and trade-offs as in the GRPO derivation (computational feasibility of rank-one form, uniform bias absorbed by damping).
 
+The effective weight is $(w_i+c)$ rather than the ideal $w_i$, introducing an additive bias $c\,F_l$ into the Hessian, where $F_l = \frac{1}{N^*}\sum_{i\in\mathcal{S}}(\nabla_{\theta_l}\log\pi_\theta(o_i|x_i))(\nabla_{\theta_l}\log\pi_\theta(o_i|x_i))^T$ is the unweighted empirical Fisher (sum over retained samples $\mathcal{S}$).
+We accept this bias for two reasons: (1) the rank-one structure is essential for Sherman--Morrison inversion (Section~\ref{sec:sherman_morrison}); (2) the adaptive damping $\lambda_l$ is computed from the inflated gradients $\|\tilde{g}_{i,l}\|^2 = (w_i+c)\|\nabla\log\pi_i\|^2$, making $\lambda_l$ larger than it would be under ideal weights by an amount $\delta\lambda_l \propto c$---this extra isotropic regularization $\delta\lambda_l I$ partially cancels the bias $c\,F_l$ (see Section~\ref{sec:per_sample_matrix} for details).
+With percentile clipping ensuring $c$ is small relative to typical positive weights, the remaining bias is small and preserves relative influence rankings.
+
+\paragraph{Three gradient types and their roles.}
+The influence pipeline uses three distinct gradient quantities.
+It is critical that each be computed in the correct form:
+
+\begin{enumerate}
+    \item \textbf{Modified gradient} $\tilde{g}_{i,l} = \sqrt{w_i+c}\,\nabla_{\theta_l}\log\pi_\theta(o_i\mid x_i)$
+    (Eq.~\eqref{eq:modified_grad}): used \emph{exclusively} to build the empirical Hessian $H_l$ and its DataInf inverse. It is \emph{never} used directly in the influence score.
+
+    \item \textbf{Training loss gradient} $g_{k,l} = -w_k\,\nabla_{\theta_l}\log\pi_\theta(o_k\mid x_k)$
+    (Eq.~\eqref{eq:loss_grad}): the actual gradient of sample $k$'s linearized PPO loss, weighted by the scalar $-w_k$. This enters the influence formula as the right-hand term $H_l^{-1}g_{k,l}$.
+
+    \item \textbf{Validation gradient} $v_l = \frac{1}{M}\sum_{j=1}^{M}\nabla_{\theta_l}\ell(x_j^{\mathrm{val}},o_j^{\mathrm{val}})$: a plain backward pass on the validation data, averaged over $M$ samples. \textbf{No PPO weighting ($w$) and no square-root modification ($\sqrt{w+c}$) are applied.} It is simply the standard gradient of the validation loss evaluated at the current policy parameters.
+\end{enumerate}
+
+Both $g_{k,l}$ and $v_l$ are \emph{unmodified} gradients; the only difference from $\tilde{g}_{i,l}$ is the scalar multiplier applied.
+Since $g_{i,l} = (-w_i)\cdot\nabla_{\theta_l}\log\pi_\theta(o_i\mid x_i)$ and $\tilde{g}_{i,l} = \sqrt{w_i+c}\cdot\nabla_{\theta_l}\log\pi_\theta(o_i\mid x_i)$ share the same base gradient vector, both are obtained from a single backward pass over sample $i$: retain $\nabla_{\theta_l}\log\pi_\theta(o_i\mid x_i)$ and scale it by $-w_i$ to get $g_{i,l}$, and by $\sqrt{w_i+c}$ to get $\tilde{g}_{i,l}$.
+
+
+%% ========================================================================
 \section{DataInf Influence Computation}
+%% ========================================================================
 
-\subsection{Per-Sample Matrix and Sherman--Morrison Inversion}
+This section presents the DataInf influence computation in full detail.
+The pipeline has five stages: (1)~define the regularized empirical Hessian, (2)~decompose it into per-sample matrices, (3)~invert each via Sherman--Morrison, (4)~apply the DataInf swap approximation, and (5)~reduce the influence score to scalar products.
 
-\begin{equation}
-    M_{i,l} = g_{1,i,l}\,g_{1,i,l}^T + \lambda_l\,I
+\subsection{Regularized Empirical Hessian}
+
+The empirical Hessian for layer $l$ is approximated as the average of per-sample outer products over retained samples $\mathcal{S}$ plus a damping term:
+\begin{equation}\label{eq:hessian}
+    H_l = \frac{1}{N^*}\sum_{i\in\mathcal{S}}\tilde{g}_{i,l}\,\tilde{g}_{i,l}^T + \lambda_l\,I
+\end{equation}
+where $N^* = |\mathcal{S}|$, $\lambda_l > 0$ is a per-layer damping coefficient and $I$ is the $d_l \times d_l$ identity matrix.
+
+This is a regularized Gauss--Newton approximation of the loss Hessian, constructed from the modified gradients $\tilde{g}_{i,l}$ of retained training samples.
+The damping $\lambda_l I$ ensures $H_l$ is strictly positive definite and well-conditioned for inversion.
+
+\subsection{Per-Sample Matrix}\label{sec:per_sample_matrix}
+
+Define the per-sample matrix:
+\begin{equation}\label{eq:M_il}
+    M_{i,l} = \tilde{g}_{i,l}\,\tilde{g}_{i,l}^T + \lambda_l\,I
 \end{equation}
 
-\begin{proposition}[Sherman--Morrison]
-$\displaystyle
-    M_{i,l}^{-1}
-    = \frac{1}{\lambda_l}\!\left(I - \frac{g_{1,i,l}\,g_{1,i,l}^T}{\lambda_l + \|g_{1,i,l}\|^2}\right)
-$
+This is a rank-one update of $\lambda_l I$.
+Observe that $H_l$ decomposes as an average of per-sample matrices:
+\begin{equation}\label{eq:hessian_decomp}
+    H_l
+    = \frac{1}{N^*}\sum_{i\in\mathcal{S}}\bigl(\tilde{g}_{i,l}\,\tilde{g}_{i,l}^T + \lambda_l I\bigr)
+    = \frac{1}{N^*}\sum_{i\in\mathcal{S}} M_{i,l}
+\end{equation}
+since $\frac{1}{N^*}\sum_{i\in\mathcal{S}} \lambda_l I = \lambda_l I$.
+
+\subsection{Positive Definiteness and Adaptive Damping}
+
+Each per-sample matrix $M_{i,l} = \tilde{g}_{i,l}\,\tilde{g}_{i,l}^T + \lambda_l I$ is the sum of a positive semi-definite rank-one matrix and $\lambda_l I$.
+For any $\lambda_l > 0$, $M_{i,l}$ is strictly positive definite:
+\begin{equation}
+    x^T M_{i,l}\,x = (\tilde{g}_{i,l}^T x)^2 + \lambda_l\|x\|^2 \ge \lambda_l\|x\|^2 > 0
+    \quad\text{for all } x \neq 0
+\end{equation}
+
+\paragraph{Practical choice of $\lambda_l$.}
+We use adaptive per-layer damping scaled by the average modified-gradient magnitude:
+\begin{equation}\label{eq:damping}
+    \lambda_l = c_\lambda \cdot \frac{1}{N^*\,d_l}\sum_{i\in\mathcal{S}}\|\tilde{g}_{i,l}\|^2
+    = c_\lambda \cdot \frac{1}{N^*\,d_l}\sum_{i\in\mathcal{S}}(w_i+c)\|\nabla_{\theta_l}\log\pi_\theta(o_i\mid x_i)\|^2
+\end{equation}
+where $c_\lambda > 0$ is a scaling constant (e.g., $c_\lambda = 0.1$), $d_l = \dim(\theta_l)$, and $\mathcal{S}$ is the set of $N^*$ samples retained after percentile clipping.
+
+\paragraph{How $\lambda_l$ absorbs the bias $c\,F_l$.}
+Since $\|\tilde{g}_{i,l}\|^2 = (w_i+c)\|\nabla\log\pi_i\|^2$, the damping decomposes as:
+\begin{equation}
+    \lambda_l
+    = \underbrace{c_\lambda\cdot\frac{1}{N^*d_l}\sum_{i\in\mathcal{S}} w_i\|\nabla\log\pi_i\|^2}_{\lambda_l^{\mathrm{ideal}}}
+    + \underbrace{c_\lambda\cdot\frac{c}{d_l}\cdot\frac{1}{N^*}\sum_{i\in\mathcal{S}}\|\nabla\log\pi_i\|^2}_{\delta\lambda_l}
+\end{equation}
+
+The extra term $\delta\lambda_l > 0$ is automatic, arising from the same shift $c$ that created the Hessian bias.
+It adds isotropic regularization $\delta\lambda_l I$ to $H_l$, which partially cancels the uniform additive bias $c\,F_l$:
+\begin{align}
+    H_l + \delta\lambda_l I
+    &= \frac{1}{N^*}\sum_{i\in\mathcal{S}}w_i(\nabla\log\pi_i)(\nabla\log\pi_i)^T
+      + c\,F_l + \lambda_l^{\mathrm{ideal}} I + \delta\lambda_l I \notag\\
+    &\approx H_l^{\mathrm{ideal}} + \lambda_l^{\mathrm{ideal}} I
+      + c\!\left(F_l - \frac{\mathrm{tr}(F_l)}{d_l}I\right)
+\end{align}
+where we used $\delta\lambda_l \approx c_\lambda \cdot c \cdot \frac{\mathrm{tr}(F_l)}{d_l}$.
+The residual $c\bigl(F_l - \frac{\mathrm{tr}(F_l)}{d_l}I\bigr)$ is the \emph{anisotropic} (traceless) part of the bias.
+It is small when $c$ is small (guaranteed by the percentile clip) and when $F_l$ is approximately isotropic (common in high-dimensional LoRA parameter spaces).
+This ensures $\lambda_l$ is commensurate with the scale of the gradient outer products, preventing either under- or over-regularization.
+
+\subsection{Sherman--Morrison Inversion}\label{sec:sherman_morrison}
+
+Since $M_{i,l}$ is a rank-one update of a scaled identity, it can be inverted in closed form.
+
+\begin{proposition}[Sherman--Morrison]\label{prop:sm}
+For $M_{i,l} = \tilde{g}_{i,l}\,\tilde{g}_{i,l}^T + \lambda_l\,I$ with $\lambda_l > 0$:
+\begin{equation}\label{eq:sm}
+    M_{i,l}^{-1} = \frac{1}{\lambda_l}\!\left(I - \frac{\tilde{g}_{i,l}\,\tilde{g}_{i,l}^T}{\lambda_l + \|\tilde{g}_{i,l}\|^2}\right)
+\end{equation}
 \end{proposition}
 
-Adaptive damping $\lambda_l$ is chosen as in the GRPO derivation to ensure positive definiteness.
+\begin{proof}
+Verify $M_{i,l}\,M_{i,l}^{-1} = I$:
+\begin{align}
+    &\bigl(\tilde{g}_{i,l}\,\tilde{g}_{i,l}^T + \lambda_l I\bigr)
+    \cdot
+    \frac{1}{\lambda_l}\!\left(I - \frac{\tilde{g}_{i,l}\,\tilde{g}_{i,l}^T}{\lambda_l + \|\tilde{g}_{i,l}\|^2}\right) \notag\\[4pt]
+    &= \frac{1}{\lambda_l}\biggl[
+        \tilde{g}_{i,l}\,\tilde{g}_{i,l}^T + \lambda_l I
+        - \frac{\bigl(\tilde{g}_{i,l}\,\tilde{g}_{i,l}^T + \lambda_l I\bigr)\,\tilde{g}_{i,l}\,\tilde{g}_{i,l}^T}{\lambda_l + \|\tilde{g}_{i,l}\|^2}
+    \biggr] \label{eq:sm_step1}\\[4pt]
+    &= \frac{1}{\lambda_l}\biggl[
+        \tilde{g}_{i,l}\,\tilde{g}_{i,l}^T + \lambda_l I
+        - \frac{\bigl(\|\tilde{g}_{i,l}\|^2 + \lambda_l\bigr)\,\tilde{g}_{i,l}\,\tilde{g}_{i,l}^T}{\lambda_l + \|\tilde{g}_{i,l}\|^2}
+    \biggr] \label{eq:sm_step2}\\[4pt]
+    &= \frac{1}{\lambda_l}\Bigl[\lambda_l I + \tilde{g}_{i,l}\,\tilde{g}_{i,l}^T - \tilde{g}_{i,l}\,\tilde{g}_{i,l}^T\Bigr]
+    = I \quad\checkmark \notag
+\end{align}
+where in \eqref{eq:sm_step2} we used $\tilde{g}_{i,l}\,\tilde{g}_{i,l}^T\,\tilde{g}_{i,l} = \|\tilde{g}_{i,l}\|^2\,\tilde{g}_{i,l}$.
+\end{proof}
 
-\subsection{DataInf Swap and Influence Score}
+\textbf{Computational cost:} Each inversion requires $O(d_l)$ operations (a single inner product $\|\tilde{g}_{i,l}\|^2$ and a scalar division), avoiding the $O(d_l^3)$ cost of general matrix inversion.
 
-Applying the DataInf swap $\bigl(\frac{1}{N}\sum_i M_{i,l}\bigr)^{-1}\approx\frac{1}{N}\sum_i M_{i,l}^{-1}$ and substituting Sherman--Morrison, the influence of training sample $k$ on a validation loss $\ell_{\mathrm{val}}$ with gradient $v_l=\nabla_{\theta_l}\ell_{\mathrm{val}}$ is:
+\subsection{DataInf Swap Approximation}\label{sec:datainf_swap}
 
-\begin{equation}\label{eq:influence}
+Computing $H_l^{-1}$ directly would require inverting a $d_l \times d_l$ matrix---prohibitive when $d_l$ is large (millions of parameters per layer in modern LLMs).
+The DataInf approximation~\cite{} swaps the average and inversion:
+\begin{equation}\label{eq:swap}
+    H_l^{-1}
+    = \left(\frac{1}{N^*}\sum_{i\in\mathcal{S}} M_{i,l}\right)^{\!-1}
+    \approx \frac{1}{N^*}\sum_{i\in\mathcal{S}} M_{i,l}^{-1}
+\end{equation}
+
+\paragraph{When is the swap accurate?}
+The approximation is exact when all $M_{i,l}$ are scalar multiples of the identity.
+It remains accurate when the per-sample gradient directions $\tilde{g}_{i,l}/\|\tilde{g}_{i,l}\|$ are approximately orthogonal across samples, so that each $M_{i,l}$ perturbs $\lambda_l I$ along a distinct direction.
+In practice, high-dimensional gradient spaces in large models make near-orthogonality a reasonable assumption.
+
+\paragraph{Practical benefit.}
+After the swap, we need only the $N^*$ individual Sherman--Morrison inverses $M_{i,l}^{-1}$ (each $O(d_l)$), giving a total cost of $O(N^*d_l)$ per layer.
+
+\subsection{Influence Score Derivation}\label{sec:influence_derivation}
+
+The influence of removing training sample $k$ on a validation loss $\ell_{\mathrm{val}}$ is defined as:
+\begin{equation}\label{eq:influence_def}
+    \mathcal{I}(k) = -\sum_{l=1}^{L} v_l^T\,H_l^{-1}\,g_{k,l}
+\end{equation}
+where $v_l = \frac{1}{M}\sum_{j=1}^{M}\nabla_{\theta_l}\ell(x_j^{\mathrm{val}},o_j^{\mathrm{val}})$ is the validation gradient averaged over the $M$-sample validation set $\mathcal{D}_{\mathrm{val}}$ (left) and $g_{k,l}$ is the \textbf{actual loss gradient} of training sample $k$ from Eq.~\eqref{eq:loss_grad} (right).
+The Hessian inverse $H_l^{-1}$ is the only component approximated via the modified gradients $\tilde{g}_{i,l}$.
+
+We now derive the closed-form scalar expression step by step.
+
+\paragraph{Step 1: Substitute the DataInf swap (Eq.~\eqref{eq:swap}).}
+\begin{equation}\label{eq:step1}
+    \mathcal{I}(k)
+    = -\sum_{l=1}^{L} v_l^T \left(\frac{1}{N^*}\sum_{i\in\mathcal{S}} M_{i,l}^{-1}\right) g_{k,l}
+\end{equation}
+
+\paragraph{Step 2: Substitute the Sherman--Morrison inverse (Eq.~\eqref{eq:sm}).}
+Recall that $M_{i,l}^{-1}$ is constructed from the \emph{modified} gradients $\tilde{g}_{i,l}$:
+\begin{align}
+    \mathcal{I}(k)
+    &= -\sum_{l=1}^{L} v_l^T
+       \left[\frac{1}{N^*}\sum_{i\in\mathcal{S}}
+       \frac{1}{\lambda_l}\!\left(I - \frac{\tilde{g}_{i,l}\,\tilde{g}_{i,l}^T}{\lambda_l + \|\tilde{g}_{i,l}\|^2}\right)
+       \right] g_{k,l} \label{eq:step2}
+\end{align}
+
+\paragraph{Step 3: Distribute $v_l^T$ on the left and $g_{k,l}$ on the right.}
+\begin{align}
+    \mathcal{I}(k)
+    &= -\sum_{l=1}^{L} \frac{1}{\lambda_l}
+       \left[
+       \frac{1}{N^*}\sum_{i\in\mathcal{S}}
+       \left(
+           v_l^T g_{k,l}
+           - \frac{(v_l^T \tilde{g}_{i,l})\,(\tilde{g}_{i,l}^T g_{k,l})}
+                  {\lambda_l + \|\tilde{g}_{i,l}\|^2}
+       \right)
+       \right] \label{eq:step3}
+\end{align}
+
+Note how $\tilde{g}_{i,l}$ appears only inside the Sherman--Morrison correction (from the Hessian), while $v_l$ and $g_{k,l}$ are the ``external'' unmodified vectors.
+
+\paragraph{Step 4: Simplify the constant term.}
+The term $v_l^T g_{k,l}$ does not depend on $i$, so $\frac{1}{N^*}\sum_{i\in\mathcal{S}} v_l^T g_{k,l} = v_l^T g_{k,l}$:
+\begin{align}
+    \mathcal{I}(k)
+    &= -\sum_{l=1}^{L} \frac{1}{\lambda_l}
+       \left[
+           v_l^T g_{k,l}
+           - \frac{1}{N^*}\sum_{i\in\mathcal{S}}
+             \frac{(v_l^T \tilde{g}_{i,l})\,(\tilde{g}_{i,l}^T g_{k,l})}
+                  {\lambda_l + \|\tilde{g}_{i,l}\|^2}
+       \right] \label{eq:step4}
+\end{align}
+
+\paragraph{Step 5: Define scalar quantities.}
+To express the formula purely in terms of inner products, define:
+\begin{equation}\label{eq:scalars}
+\begin{aligned}
+    L_{l,k}  &= v_l^T\,g_{k,l}  &&\text{(validation--sample alignment; \emph{actual} gradient)} \\[2pt]
+    L_{l,i}  &= v_l^T\,\tilde{g}_{i,l}  &&\text{(validation--Hessian alignment; \emph{modified} gradient)} \\[2pt]
+    L_{l,ik} &= \tilde{g}_{i,l}^T\,g_{k,l} &&\text{(Hessian--sample cross product; modified $\times$ actual)} \\[2pt]
+    L_{l,ii} &= \|\tilde{g}_{i,l}\|^2 = \tilde{g}_{i,l}^T\,\tilde{g}_{i,l} &&\text{(modified gradient norm squared)}
+\end{aligned}
+\end{equation}
+
+\textbf{Key distinction:} $L_{l,k}$ and $L_{l,ik}$ involve the \emph{actual} loss gradient $g_{k,l}$ (Eq.~\eqref{eq:loss_grad}), while $L_{l,i}$ and $L_{l,ii}$ involve only the \emph{modified} gradient $\tilde{g}_{i,l}$ (Eq.~\eqref{eq:modified_grad}).
+
+\paragraph{Step 6: Final scalar-product formula.}
+Substituting \eqref{eq:scalars} into \eqref{eq:step4} and flipping the overall sign:
+\begin{equation}\label{eq:influence_final}
 \boxed{
     \mathcal{I}(k)
     = \sum_{l=1}^{L}\frac{1}{\lambda_l}
     \left[
-      \frac{1}{N}\sum_{i=1}^{N}
-      \frac{L_{l,i}\,L_{l,ik}}{\lambda_l + L_{l,ii}}
+      \frac{1}{N^*}\sum_{i\in\mathcal{S}}
+      \frac{L_{l,i}\;L_{l,ik}}{\lambda_l + L_{l,ii}}
       \;-\; L_{l,k}
     \right]
 }
 \end{equation}
-where:
+
+\paragraph{Computational complexity.}
 \begin{itemize}
-    \item $L_{l,i} = v_l^T\,g_{1,i,l}$ \;\;(test--train alignment),
-    \item $L_{l,ik} = g_{1,i,l}^T\,g_{1,k,l}$ \;\;(train--train similarity),
-    \item $L_{l,ii} = \|g_{1,i,l}\|^2$ \;\;(gradient magnitude),
-    \item $L_{l,k} = v_l^T\,g_{1,k,l}$ \;\;(test--target alignment).
+    \item \textbf{Gradient computation:} $N^*$ backward passes over retained training samples, each producing $\tilde{g}_{i,l}$ and $g_{i,l}$ for all layers. $M$ additional backward passes over $\mathcal{D}_{\mathrm{val}}$ to compute $v_l$.
+    \item \textbf{Precomputation:} $O(N^* \cdot d_l)$ per layer to compute all $L_{l,i}$ and $L_{l,ii}$ from modified gradients.
+    \item \textbf{Per-query scoring:} For each target sample $k \in \mathcal{S}$, $O(N^* \cdot L)$ scalar inner-product operations (one $L_{l,ik}$ per retained sample per layer), plus one $L_{l,k}$ per layer.
+    \item \textbf{All-pairs scoring:} Computing $\mathcal{I}(k)$ for all $k \in \mathcal{S}$ costs $O({N^*}^2 \cdot d_l \cdot L)$ total.
 \end{itemize}
 
-The formula is identical in structure to the GRPO influence score; only the contents of $g_{1,i,l}$ differ through the PPO-specific weights $w_{i,t}$.
 
+%% ========================================================================
 \section{Implementation Algorithm}
+%% ========================================================================
 
 \begin{algorithm}[H]
-\caption{Influence Computation for Linearized PPO}
+\caption{Influence Computation for Linearized PPO (DataInf)}
 \begin{algorithmic}[1]
-\STATE \textbf{Input:} Policy $\pi_\theta$, value function $V_\phi$, training data $\{(x_i,o_i)\}_{i=1}^N$, validation sample $(x_{\mathrm{val}},o_{\mathrm{val}})$
+\STATE \textbf{Input:} Policy $\pi_\theta$, value function $V_\phi$, training data $\{(x_i,o_i)\}_{i=1}^N$, validation set $\mathcal{D}_{\mathrm{val}} = \{(x_j^{\mathrm{val}},o_j^{\mathrm{val}})\}_{j=1}^M$, damping scale $c_\lambda$, positivity buffer $\varepsilon$
 \STATE \textbf{Output:} Influence scores $\{\mathcal{I}(k)\}_{k=1}^N$
 
-\STATE \textbf{// Step 1: Compute advantages and effective weights}
+\STATE
+\STATE \textbf{// Stage 1: Compute per-sample advantages and effective weights}
 \FOR{$i=1$ to $N$}
-    \STATE Compute GAE advantages $\hat{A}_{i,t}$ via Eq.~\eqref{eq:gae}
-    \STATE Evaluate active mask $m_{i,t}$ at current $r_{i,t}$
-    \STATE $w_{i,t} \leftarrow (m_{i,t}\,\hat{A}_{i,t} - \beta)\,/\,(N\,|O_i|)$
+    \STATE Compute per-sample advantage $\hat{A}_i$ (e.g., RM score $R_{\mathrm{RM}}(x_i,o_i)$ or mean GAE over tokens)
+    \STATE Evaluate per-sample active indicator $m_i \in \{0,1\}$
+    \STATE $w_i \leftarrow (m_i\,\hat{A}_i - \beta)\,/\,N$
 \ENDFOR
-\STATE $c \leftarrow \epsilon_c \cdot \max_{i,t}|w_{i,t}|$
 
-\STATE \textbf{// Step 2: Compute modified training gradients (one backprop per sample)}
-\FOR{$i=1$ to $N$}
+\STATE
+\STATE \textbf{// Stage 2: Compute shift constant and identify retained samples}
+\STATE \textit{(All $w_i$ are known from Stage 1 via the reward model and value function; no backward pass is needed yet.)}
+\STATE $Q_p \leftarrow p\text{-th percentile of }\{w_i\}_{i=1}^N$ \hfill (e.g., $p=5$)
+\STATE $c \leftarrow \max(0,\;-Q_p) + \varepsilon$ \hfill (Eq.~\ref{eq:c_formula})
+\STATE $\mathcal{S} \leftarrow \{i : w_i \ge Q_p\}$, \quad $N^* \leftarrow |\mathcal{S}|$ \hfill (exclude bottom-$p\%$ outliers; their backward passes are skipped entirely)
+
+\STATE
+\STATE \textbf{// Stage 3: Compute both gradient types for retained training samples}
+\FOR{$i \in \mathcal{S}$}
+    \STATE Run one backward pass for sample $i$; let $h_{i,l} = \nabla_{\theta_l}\log\pi_\theta(o_i\mid x_i)$ for each layer $l$
+    \STATE \hspace{1em} $\tilde{g}_{i,l} \leftarrow \sqrt{w_i+c}\;h_{i,l}$ \hfill (modified gradient, Eq.~\ref{eq:modified_grad})
+    \STATE \hspace{1em} $g_{i,l} \leftarrow -w_i\;h_{i,l}$ \hfill (actual loss gradient, Eq.~\ref{eq:loss_grad})
+\ENDFOR
+
+\STATE
+\STATE \textbf{// Stage 4: Compute validation gradient and adaptive damping}
+\STATE Run $M$ backward passes over $\mathcal{D}_{\mathrm{val}}$; for each layer $l$:
+\STATE \hspace{1em} $v_l \leftarrow \frac{1}{M}\sum_{j=1}^{M}\nabla_{\theta_l}\ell(x_j^{\mathrm{val}},o_j^{\mathrm{val}})$ \hfill (plain gradient, no $w$ or $\sqrt{\cdot}$ scaling)
+\FOR{each layer $l$}
+    \STATE $\lambda_l \leftarrow c_\lambda \cdot \frac{1}{N^*\,d_l}\sum_{i\in\mathcal{S}}\|\tilde{g}_{i,l}\|^2$
+    \hfill (Eq.~\ref{eq:damping}; $\delta\lambda_l$ absorbed here)
+\ENDFOR
+
+\STATE
+\STATE \textbf{// Stage 5: Precompute Hessian-side scalars (from $\tilde{g}$, retained samples only)}
+\FOR{$i\in\mathcal{S}$}
     \FOR{each layer $l$}
-        \STATE $g_{1,i,l} \leftarrow \sum_t \sqrt{w_{i,t}+c}\;\nabla_{\theta_l}\log\pi_\theta(o_{i,t}\mid o_{<t})$
+        \STATE $L_{l,i} \leftarrow v_l^T\,\tilde{g}_{i,l}$
+        \hfill (validation--Hessian alignment)
+        \STATE $L_{l,ii} \leftarrow \|\tilde{g}_{i,l}\|^2$
+        \hfill (modified gradient norm squared)
     \ENDFOR
 \ENDFOR
 
-\STATE \textbf{// Step 3: Compute validation gradient}
-\FOR{each layer $l$}
-    \STATE $v_l \leftarrow \nabla_{\theta_l}\ell_{\mathrm{val}}$
-    \STATE Compute adaptive damping $\lambda_l$
-\ENDFOR
-
-\STATE \textbf{// Step 4: Compute influence scores via scalar products}
-\FOR{$k=1$ to $N$}
+\STATE
+\STATE \textbf{// Stage 6: Compute influence scores}
+\FOR{$k\in\mathcal{S}$}
     \STATE $\mathcal{I}(k) \leftarrow 0$
     \FOR{each layer $l$}
-        \STATE $L_{l,k} \leftarrow v_l^T\,g_{1,k,l}$
+        \STATE $L_{l,k} \leftarrow v_l^T\,g_{k,l}$
+        \hfill (validation--sample; \emph{actual} gradient, no $\sqrt{\cdot}$)
         \STATE $\mathrm{sum} \leftarrow 0$
-        \FOR{$i=1$ to $N$}
-            \STATE $L_{l,i} \leftarrow v_l^T\,g_{1,i,l}$;\quad
-                   $L_{l,ik} \leftarrow g_{1,i,l}^T\,g_{1,k,l}$;\quad
-                   $L_{l,ii} \leftarrow \|g_{1,i,l}\|^2$
-            \STATE $\mathrm{sum} \leftarrow \mathrm{sum} + L_{l,i}\,L_{l,ik}\,/\,(\lambda_l + L_{l,ii})$
+        \FOR{$i\in\mathcal{S}$}
+            \STATE $L_{l,ik} \leftarrow \tilde{g}_{i,l}^T\,g_{k,l}$
+            \hfill (Hessian--sample cross; modified $\times$ actual)
+            \STATE $\mathrm{sum} \leftarrow \mathrm{sum} + \dfrac{L_{l,i}\;L_{l,ik}}{\lambda_l + L_{l,ii}}$
         \ENDFOR
-        \STATE $\mathcal{I}(k) \leftarrow \mathcal{I}(k) + \frac{1}{\lambda_l}\bigl[\frac{1}{N}\,\mathrm{sum} - L_{l,k}\bigr]$
+        \STATE $\mathcal{I}(k) \leftarrow \mathcal{I}(k) + \dfrac{1}{\lambda_l}\!\left[\dfrac{1}{N^*}\,\mathrm{sum} - L_{l,k}\right]$
     \ENDFOR
 \ENDFOR
-\STATE \textbf{return} $\{\mathcal{I}(k)\}_{k=1}^N$
+\STATE \textbf{return} $\{\mathcal{I}(k)\}_{k\in\mathcal{S}}$
 \end{algorithmic}
 \end{algorithm}
 
-\textbf{Computational cost:} Only $N$ backpropagations are needed (one per training sample), compared to $N\times G$ for GRPO where $G$ responses are generated per prompt.
+\textbf{Computational cost:} Each retained training sample ($i \in \mathcal{S}$, at most $N^* \approx 0.95N$) requires one backward pass, producing both $\tilde{g}_{i,l}$ and $g_{i,l}$.
+The validation gradient $v_l$ is computed by averaging $M$ backward passes over $\mathcal{D}_{\mathrm{val}}$, giving $N^*+M$ backward passes total.
 
+%% ========================================================================
 \section{Comparison with GRPO}
+%% ========================================================================
 
 \begin{table}[h]
 \centering
@@ -241,29 +486,32 @@ The formula is identical in structure to the GRPO influence score; only the cont
 \textbf{Aspect} & \textbf{GRPO} & \textbf{PPO} \\
 \midrule
 Batch structure & $G_1$ prompts $\times$ $G$ responses & $N$ prompt--response pairs \\
-Advantage & $\hat{A}_i = \frac{R_i - \mu_G}{\sigma_G}$ (response-level) & $\hat{A}_{i,t}$ via GAE (token-level) \\
+Advantage & $\hat{A}_i = \frac{R_i - \mu_G}{\sigma_G}$ (group-normalized) & $\hat{A}_i$ from $V_\phi$ (per-sample) \\
 Value function & Not needed & Learned $V_\phi$ required \\
 Ratio denominator & $\pi_{\mathrm{ref}}$ & $\pi_{\mathrm{old}}$ \\
-Weight variation & Constant across tokens in a response & Varies per token \\
-Effective weight & $w_{i,t} = \frac{m_{i,t}\hat{A}_i - \beta}{G_1|O_i|}$ & $w_{i,t} = \frac{m_{i,t}\hat{A}_{i,t} - \beta}{N|O_i|}$ \\
-Backprops & $N \times G$ (one per response) & $N$ (one per sample) \\
+Weight variation & One per sample & One per sample \\
+Effective weight & $w_i = \frac{m_i\hat{A}_i - \beta}{G_1}$ & $w_i = \frac{m_i\hat{A}_i - \beta}{N}$ \\
+Backprops needed & $N \times G$ (one per response) & $N$ (one per sample) \\
 \midrule
-\multicolumn{3}{l}{\textit{Shared:} Linearization, two-gradient trick, Sherman--Morrison, DataInf formula} \\
+\multicolumn{3}{l}{\textit{Shared:} Linearization, modified gradient $\tilde{g}_{i,l}$, Sherman--Morrison, DataInf formula} \\
 \bottomrule
 \end{tabular}
 \caption{Structural comparison of the linearized influence derivation for GRPO vs.\ PPO.}
 \end{table}
 
+
+%% ========================================================================
 \section{Summary}
+%% ========================================================================
 
 The linearized PPO loss with DataInf influence functions follows the same five-step recipe as GRPO:
 \begin{enumerate}
     \item \textbf{Linearize} the clipped surrogate via active masking and first-order Taylor expansion.
-    \item \textbf{Define effective weights} $w_{i,t}$ incorporating advantages, KL penalty, and mask.
-    \item \textbf{Construct modified gradients} $g_{1,i,l}$ with $\sqrt{w_{i,t}+c}$ coefficients for linear Hessian weights.
-    \item \textbf{Invert} the per-sample Hessian approximation via Sherman--Morrison ($O(d)$ per sample).
-    \item \textbf{Compute influence} via the DataInf swap in closed form using scalar products.
+    \item \textbf{Define effective weights} $w_i = (m_i\hat{A}_i - \beta)/N$, one per sample.
+    \item \textbf{Construct two gradient types} per sample from a single backward pass: the modified gradient $\tilde{g}_{i,l} = \sqrt{w_i+c}\,\nabla_{\theta_l}\log\pi_\theta(o_i|x_i)$ (where $c = \max(0,-w_{\min})+\varepsilon$) for the Hessian, and the actual loss gradient $g_{i,l} = -w_i\,\nabla_{\theta_l}\log\pi_\theta(o_i|x_i)$ for the influence score.
+    \item \textbf{Invert} the per-sample Hessian $M_{i,l} = \tilde{g}_{i,l}\tilde{g}_{i,l}^T + \lambda_l I$ via Sherman--Morrison in $O(d_l)$ per sample.
+    \item \textbf{Compute influence} $\mathcal{I}(k) = -\sum_l v_l^T H_l^{-1} g_{k,l}$ via the DataInf swap, reducing to scalar products of $v_l$, $\tilde{g}_{i,l}$, and $g_{k,l}$ (Eq.~\eqref{eq:influence_final}).
 \end{enumerate}
-The only changes from GRPO are the absence of group structure (simpler summation over $N$ samples), per-token GAE advantages in place of response-level normalized rewards, and the use of the behavior policy $\pi_{\mathrm{old}}$ as the ratio baseline.
+The only changes from GRPO are the absence of group structure (simpler summation over $N$ samples), per-sample advantages obtained from a learned value function in place of group-relative normalized rewards, and the use of the behavior policy $\pi_{\mathrm{old}}$ as the ratio baseline.
 
 \end{document}

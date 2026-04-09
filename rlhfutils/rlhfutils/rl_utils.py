@@ -141,7 +141,11 @@ class ScriptArguments:
     run_name: Optional[str] = field(default="llamatrl", metadata={"help": "wandb run name"})
     val_strategy: Optional[str] = field(default="random", metadata={"help": "rollout strategy, start with high var, high mean, etc"})
     gen_data_dir: Optional[str] = field(default=None, metadata={"help": "directory to save generated data"})
-    
+    datainf: Optional[bool] = field(default=False, metadata={"help": "whether to use DataInf influence for sample selection"})
+    datainf_damping_scale: Optional[float] = field(default=0.1, metadata={"help": "c_lambda for DataInf adaptive damping"})
+    datainf_percentile: Optional[float] = field(default=5.0, metadata={"help": "percentile p for DataInf weight clipping"})
+    datainf_eps: Optional[float] = field(default=1e-8, metadata={"help": "epsilon for DataInf shift constant positivity"})
+
 DEFAULT_PAD_TOKEN = "[PAD]"
 DEFAULT_EOS_TOKEN = "</s>"
 DEFAULT_BOS_TOKEN = "</s>"
@@ -249,6 +253,9 @@ def load_models(script_args, loadms="rmppo", dev=0):
             remove_unused_columns=False, 
             sanity_check=script_args.sanity_check,
             val_loss_type=script_args.val_loss_type,
+            datainf_damping_scale=script_args.datainf_damping_scale,
+            datainf_percentile=script_args.datainf_percentile,
+            datainf_eps=script_args.datainf_eps,
         )
         model = AutoModelForCausalLMWithValueHead.from_pretrained(
             script_args.model_name,
@@ -344,6 +351,9 @@ def load_model_with_adapter(script_args):
         kl_penalty=script_args.kl_penalty, 
         remove_unused_columns=False, 
         sanity_check=script_args.sanity_check,
+        datainf_damping_scale=script_args.datainf_damping_scale,
+        datainf_percentile=script_args.datainf_percentile,
+        datainf_eps=script_args.datainf_eps,
     )
 
     model = AutoModelForCausalLMWithValueHead.from_pretrained(
@@ -1254,7 +1264,7 @@ def train_loop_one_step(script_args, ppo_trainer, reward_model, tokenizer, qafor
         if script_args.save_freq and (epoch+1) % script_args.save_freq == 0:
             ppo_trainer.save_pretrained(script_args.output_dir + f"step_{epoch+1}")
 
-def train_loop_with_validation(script_args, ppo_trainer, reward_model, tokenizer, qaform, min_length=20, val_question_tensors=None, val_questions=None, reward_tokenizer=None):
+def train_loop_with_validation(script_args, ppo_trainer, reward_model, tokenizer, qaform, min_length=20, val_question_tensors=None, val_questions=None, reward_tokenizer=None, use_datainf=False):
     
     # global likemod, liketok, slikemod, sliketok
     
@@ -1540,10 +1550,14 @@ def train_loop_with_validation(script_args, ppo_trainer, reward_model, tokenizer
             # TODO need to tune the scaling stuff a little bit
             rewards = [rewards[i]+bonuses[i] for i in range(len(rewards))]
                    
-        # TODO: add measure timing for reward model scoring step
-        stats = ppo_trainer.step_with_validation(question_tensors, response_tensors, rewards, 
-                                                 val_question_tensors, val_response_tensors, val_rewards,
-                                                 timing, gen_data_dir=script_args.gen_data_dir)
+        if use_datainf:
+            stats = ppo_trainer.step_datainf(question_tensors, response_tensors, rewards,
+                                             val_question_tensors, val_response_tensors, val_rewards,
+                                             timing, gen_data_dir=script_args.gen_data_dir)
+        else:
+            stats = ppo_trainer.step_with_validation(question_tensors, response_tensors, rewards,
+                                                     val_question_tensors, val_response_tensors, val_rewards,
+                                                     timing, gen_data_dir=script_args.gen_data_dir)
         
         if script_args.sanity_check:
             print('len of xs', len(ppo_trainer._xs))

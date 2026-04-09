@@ -1,0 +1,704 @@
+\documentclass{article}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{algorithm,algorithmic}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\newtheorem{proposition}{Proposition}
+\newtheorem{lemma}{Lemma}
+
+\title{Influence Functions for GRPO: Linearized Loss Derivation with DataInf}
+\author{Research Notes}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+
+We derive a linearized form of the GRPO (Group Relative Policy Optimization) loss that enables application of DataInf influence function approximation. The key challenges are: (1) handling the non-differentiable min-clipped term, (2) linearizing the KL divergence, and (3) ensuring the empirical Hessian contains linear (not squared) advantage weights.
+
+\section{GRPO Loss Formulation}
+
+\subsection{Original GRPO Objective}
+
+The GRPO loss for a batch of samples is:
+
+\begin{equation}
+\mathcal{L}_{\text{GRPO}} = -\frac{1}{G_1}\sum_{i=1}^{G_1} \frac{1}{|O_i|}\sum_{t \in O_i} \min\left(r_{i,t} \hat{A}_{i,t}, \text{clip}(r_{i,t}, 1-\epsilon, 1+\epsilon)\hat{A}_{i,t}\right) + \beta D_{\text{KL}}(\pi_\theta \| \pi_{\text{ref}})
+\end{equation}
+
+where:
+\begin{itemize}
+    \item $G_1$ is the number of prompts in the batch
+    \item $O_i$ is the set of output tokens for prompt $i$
+    \item $r_{i,t} = \frac{\pi_\theta(o_{i,t}|o_{i,<t})}{\pi_{\text{ref}}(o_{i,t}|o_{i,<t})}$ is the importance ratio
+    \item $\hat{A}_{i,t} = \frac{R(o_i, o_i) - \text{mean}(G_1)}{\sigma(G_1)}$ is the normalized advantage
+    \item $\beta$ is the KL penalty coefficient
+\end{itemize}
+
+\subsection{Handling the Min-Clipped Term}
+
+Define an active mask:
+\begin{equation}
+m_{i,t} = \begin{cases}
+1 & \text{if } \hat{A}_{i,t} \geq 0 \text{ and } r \leq 1+\epsilon \\
+1 & \text{if } \hat{A}_{i,t} < 0 \text{ and } r \geq 1-\epsilon \\
+0 & \text{otherwise}
+\end{cases}
+\end{equation}
+
+Using this mask, we can write:
+\begin{equation}
+\mu(r, \hat{A}) = \min(r\hat{A}, \text{clip}(r, 1-\epsilon, 1+\epsilon)\hat{A}) = m \cdot r \hat{A} + (1-m) \cdot \text{clip}(r, 1-\epsilon, 1+\epsilon)\hat{A}
+\end{equation}
+
+The loss becomes:
+\begin{equation}
+\mathcal{L}_{\text{GRPO}} = -\frac{1}{G_1}\sum_{i=1}^{G_1} \frac{1}{|O_i|}\sum_{t \in O_i} m_{i,t} r_{i,t} \hat{A}_{i,t} + \beta D_{\text{KL}}(\pi_\theta \| \pi_{\text{ref}}) + \text{const}_\theta
+\end{equation}
+
+\textbf{Justification for dropping constant:} The term $(1-m) \cdot \text{clip}(r, 1-\epsilon, 1+\epsilon)\hat{A}$ involves clipped ratios. When $m_{i,t} = 0$, the ratio $r_{i,t}$ is outside $[1-\epsilon, 1+\epsilon]$, and we use the clipped value which is independent of $\theta$ in the active optimization region. Since $\nabla_\theta \text{const} = 0$, this term does not contribute to gradients and can be dropped for optimization purposes.
+
+\subsection{Linearizing the KL Divergence}
+
+The per-sample KL divergence is:
+\begin{equation}
+D_{\text{KL}}(\pi_\theta \| \pi_{\text{ref}}) \approx \frac{1}{|O|}\sum_{t} \left[\log \pi_\theta(o_{i,t}|o_{<t}) - \log\pi_{\text{ref}}(o_{i,t}|o_{<t})\right]
+\end{equation}
+
+\textbf{Linearization via Taylor expansion:} For small policy updates $\Delta\theta = \theta - \theta_0$:
+
+\begin{align}
+\log \pi_\theta(o_{i,t}|o_{<t}) &\approx \log \pi_{\theta_0}(o_{i,t}|o_{<t}) + \nabla_\theta \log \pi_{\theta}(o_{i,t}|o_{<t})\big|_{\theta_0} \cdot \Delta\theta \\
+&= \log \pi_{\theta_0}(o_{i,t}|o_{<t}) + \Delta_{i,t}(\theta_0)
+\end{align}
+
+where $\Delta_{i,t}(\theta) = \nabla_\theta \log \pi_{\theta}(o_{i,t}|o_{<t}) \cdot (\theta - \theta_0)$.
+
+For small updates, the importance ratio becomes:
+\begin{equation}
+r_{i,t} = \frac{\pi_\theta(o_{i,t}|o_{<t})}{\pi_{\text{ref}}(o_{i,t}|o_{<t})} = \exp(\Delta_{i,t}(\theta)) \approx 1 + \Delta_{i,t}(\theta)
+\end{equation}
+
+Substituting into the active terms (where $m_{i,t} = 1$):
+\begin{equation}
+r_{i,t} \hat{A}_{i,t} \approx (1 + \Delta_{i,t}) \hat{A}_{i,t} = \hat{A}_{i,t} + \hat{A}_{i,t}\Delta_{i,t}
+\end{equation}
+
+The KL term linearizes to:
+\begin{equation}
+\beta D_{\text{KL}}(\pi_\theta \| \pi_{\text{ref}}) \approx \beta \sum_t (\log\pi_\theta - \log\pi_{\text{ref}}) = \beta\sum_t \log\pi_\theta + \text{const}_\theta
+\end{equation}
+
+\textbf{Justification for dropping constant:} The term $-\beta\sum_t \log\pi_{\text{ref}}$ is independent of $\theta$ since $\pi_{\text{ref}}$ is a fixed reference policy. Therefore $\nabla_\theta(-\beta\sum_t \log\pi_{\text{ref}}) = 0$.
+
+\subsection{Linearized GRPO Loss}
+
+Combining the above, the linearized loss is:
+
+\begin{equation}\label{eq:linearized_loss}
+\boxed{
+\mathcal{L}_{\text{GRPO}} \approx -\frac{1}{G_1}\sum_{i}\frac{1}{|O_i|}\sum_t m_{i,t}\hat{A}_{i,t}\log\pi_\theta(o_{i,t}|o_{<t}) + \beta\sum_t \log\pi_\theta(o_{i,t}|o_{<t})
+}
+\end{equation}
+
+Define the effective weight:
+\begin{equation}
+w_{i,t} = \frac{m_{i,t}\hat{A}_{i,t} - \beta}{G_1|O_i|}
+\end{equation}
+
+Then:
+\begin{equation}
+\mathcal{L}_{\text{GRPO}} = -\sum_i\sum_t w_{i,t} \log\pi_\theta(o_{i,t}|o_{<t})
+\end{equation}
+
+\section{Per-Sample Gradient}
+
+The gradient for training sample $i$ (one prompt with its responses) is:
+
+\begin{equation}
+g_i(\theta) = \nabla_\theta \mathcal{L}_i = -\sum_t w_{i,t} \nabla_\theta \log\pi_\theta(o_{i,t}|o_{<t})
+\end{equation}
+
+For layer $l$ with parameters $\theta_l$:
+\begin{equation}
+g_{i,l} = -\sum_t w_{i,t} \nabla_{\theta_l} \log\pi_\theta(o_{i,t}|o_{<t})
+\end{equation}
+
+\section{Empirical Hessian with Linear Weights}
+
+\subsection{The Squared Weight Problem}
+
+\textbf{Naive approach (incorrect):} One might compute:
+\begin{equation}
+G_l^{\text{naive}} = \frac{1}{n}\sum_{i=1}^n g_{i,l}g_{i,l}^T
+\end{equation}
+
+Because $g_{i,l}$ is a weighted sum of per-token gradient terms with coefficients $w_{i,t}$, the outer product $g_{i,l}g_{i,l}^T$ produces \textbf{squared weights} $w_{i,t}^2$ in the diagonal per-token contributions rather than the desired linear weights $w_{i,t}$.
+
+\textbf{Problem:} This gives us $w_{i,t}^2$ (squared weights) rather than $w_{i,t}$ (linear weights), distorting the curvature information used in influence computation.
+
+\subsection{The Two-Gradient Trick (Theoretical)}
+
+To obtain linear weights in the Hessian approximation, we would ideally use:
+
+\textbf{Theoretical construction:} Compute two separate gradients:
+
+\begin{align}
+\tilde{g}_{i,l} &= \sum_t \sqrt{w_{i,t} + c} \cdot \nabla_{\theta_l}\log\pi_\theta(o_{i,t}|o_{<t}) \\
+g_{2,i,l} &= \sum_t \nabla_{\theta_l}\log\pi_\theta(o_{i,t}|o_{<t})
+\end{align}
+
+where $c > 0$ is chosen such that $w_{i,t} + c > 0$ for all $i,t$, check eq(33) for details.
+
+Then form:
+\begin{equation}
+\tilde{G}_{i,l}^{\text{ideal}} = \tilde{g}_{i,l}\tilde{g}_{i,l}^T - c \cdot g_{2,i,l}g_{2,i,l}^T
+\end{equation}
+
+\textbf{Why this gives linear weights:} The diagonal per-token contributions of $\tilde{g}_{i,l}\tilde{g}_{i,l}^T - c \cdot g_{2,i,l}g_{2,i,l}^T$ yield $(w_{i,t}+c) - c = w_{i,t}$ (linear weights), while off-diagonal cross-token terms vanish under the assumption that token-level gradient directions are approximately uncorrelated.
+The result is a Hessian approximation with \textbf{exactly} linear weights $w_{i,t}$.
+
+\subsection{Practical Approximation}
+
+\textbf{Computational Challenge:} The ideal formulation $\tilde{G}_{i,l}^{\text{ideal}} = \tilde{g}_{i,l}\tilde{g}_{i,l}^T - c \cdot g_{2,i,l}g_{2,i,l}^T$ presents severe computational issues:
+
+\begin{enumerate}
+    \item This is a \textbf{rank-two} matrix (difference of two rank-one matrices)
+    \item Standard Sherman-Morrison applies only to rank-one updates
+    \item Would require Woodbury matrix identity with two updates (significantly more complex)
+    \item Alternatively, would require explicitly forming the $d_l \times d_l$ matrices and subtracting them
+    \item For modern LLMs with $d_l \sim 10^6$ to $10^9$ per layer, storing these matrices is infeasible
+\end{enumerate}
+
+\textbf{Our practical approximation:} We drop the $c \cdot g_{2,i,l}g_{2,i,l}^T$ term entirely:
+
+\begin{equation}
+\tilde{G}_{i,l} := \tilde{g}_{i,l}\tilde{g}_{i,l}^T \quad \text{(practical)}
+\end{equation}
+
+This gives us a rank-one Hessian approximation at the sample level with weights approximately $(w_{i,t}+c) \approx w_{i,t}$ for small $c$.
+
+\textbf{What we lose:} Instead of pure $w_{i,t}$, we get $(w_{i,t} + c)$ in the weights, introducing a small uniform bias.
+
+\textbf{Justification for this approximation:}
+
+\begin{enumerate}
+    \item \textbf{Computational feasibility:} With this form, we have a rank-one matrix $\tilde{g}_{i,l}\tilde{g}_{i,l}^T$ which admits efficient Sherman-Morrison inversion without ever forming the full $d_l \times d_l$ matrix
+    
+    \item \textbf{Small constant $c$:} If we choose $c$ to be small (e.g., $c = \min_{i,t}|w_{i,t}| / 10$), then:
+    \begin{equation}
+    w_{i,t} + c \approx w_{i,t} \quad \text{when } |w_{i,t}| \gg c
+    \end{equation}
+    
+    \item \textbf{Uniform shift:} The constant $c$ shifts all weights uniformly. While this introduces bias, it affects all samples equally, preserving relative influence rankings
+    
+    \item \textbf{Absorbed by damping:} The effect of $c$ can be partially absorbed by the damping parameter $\lambda_l$, which we tune adaptively anyway
+\end{enumerate}
+
+% \textbf{Choice of $c$:} We set:
+% \begin{equation}
+% c = \epsilon \cdot \max_{i,t} |w_{i,t}|
+% \end{equation}
+% where $\epsilon \in [0.01, 0.1]$ is a small constant (e.g., $\epsilon = 0.05$). This ensures:
+% \begin{itemize}
+%     \item $w_{i,t} + c > 0$ for all samples (enabling real-valued square root)
+%     \item $c$ is small relative to the range of weights (minimizing bias)
+% \end{itemize}
+
+\subsection{Implementation Requirements}
+
+With the practical approximation, we only need:
+
+\begin{enumerate}
+    \item \textbf{Single backpropagation per sample:} One backward pass per training sample produces both $\tilde{g}_{i,l}$ (with $\sqrt{w_{i,t}+c}$ weighting) and $g_{i,l}$ (with $-w_{i,t}$ weighting).
+    \item \textbf{No theoretical second gradient:} We drop the $g_{2,i,l}$ term from the ideal construction; the rank-one approximation $\tilde{G}_{i,l} = \tilde{g}_{i,l}\tilde{g}_{i,l}^T$ suffices.
+    \item \textbf{Direct Sherman-Morrison:} Use $M_{i,l} = \tilde{g}_{i,l}\tilde{g}_{i,l}^T + \lambda I$ (rank-one + diagonal).
+\end{enumerate}
+
+\textbf{Computational cost:} One backward pass per training sample gives both gradient types. An additional $M$ backward passes over $\mathcal{D}_{\mathrm{val}}$ yield $v_l$, for $n + M$ total backward passes.
+
+For layer-wise analysis, the aggregate Hessian approximation is:
+\begin{equation}
+\tilde{G}_l = \frac{1}{n}\sum_{i=1}^n \tilde{G}_{i,l} = \frac{1}{n}\sum_{i=1}^n \tilde{g}_{i,l}\tilde{g}_{i,l}^T
+\end{equation}
+
+
+
+
+
+
+
+
+\section{DataInf Approximation}
+
+
+
+\subsection{Choice of Constant $c$}
+
+To ensure $w_{i,t} + c > 0$ for all samples and tokens (required for real-valued square root), we set:
+
+\begin{equation}
+c = \max\{0, -\min_{i,t} w_{i,t}\} + \varepsilon
+\end{equation}
+where $\varepsilon > 0$ is a small constant (e.g., $\varepsilon = 10^{-8}$) ensuring strict positivity.
+This ensures $w_{i,t} + c > 0$ for all $i,t$, with equality only when $w_{i,t}$ is the minimum (most negative) weight.
+
+\subsection{Three Types of Gradients}
+
+We work with three distinct gradient quantities:
+
+\subsubsection{Validation Gradient}
+
+For a validation set $\mathcal{D}_{\mathrm{val}} = \{(x_j^{\mathrm{val}}, o_j^{\mathrm{val}})\}_{j=1}^M$, the validation gradient is the average over the validation set:
+\begin{equation}
+v_l = \frac{1}{M}\sum_{j=1}^{M} \nabla_{\theta_l} \ell(x_j^{\mathrm{val}}, o_j^{\mathrm{val}})
+\end{equation}
+
+In practice, this is computed by accumulating gradients across $M$ validation backward passes.
+
+\subsubsection{Hessian Construction Gradient (with Square Root Trick)}
+
+For constructing the Hessian approximation:
+\begin{equation}
+\tilde{g}_{i,l} = \sum_{t \in O_i} \sqrt{w_{i,t} + c} \cdot \nabla_{\theta_l}\log\pi_\theta(o_{i,t}|o_{<t})
+\end{equation}
+
+This uses the square root coefficient to avoid squared weights in the Hessian.
+
+\subsubsection{GRPO Sample Gradient (Linear Weights)}
+
+For the actual GRPO gradient of training sample $i$:
+\begin{equation}
+g_{i,l} = -\sum_{t \in O_i} w_{i,t} \cdot \nabla_{\theta_l}\log\pi_\theta(o_{i,t}|o_{<t})
+\end{equation}
+
+This is the true GRPO gradient with linear weights $w_{i,t}$ (note the negative sign from the loss formulation).
+
+\textbf{Important distinction:} 
+\begin{itemize}
+    \item $\tilde{g}_{i,l}$ is used \textbf{only} to construct $M_{i,l}$ for the Hessian approximation
+    \item $g_{i,l}$ is the \textbf{actual training gradient} used in influence computation
+\end{itemize}
+
+\subsection{Per-Sample Matrix (Practical Form)}
+
+For each training sample $i$, the matrix used in Hessian approximation is:
+\begin{equation}
+M_{i,l} = \tilde{g}_{i,l}\tilde{g}_{i,l}^T + \lambda_l I
+\end{equation}
+
+Expanding (after dropping cross-terms):
+\begin{equation}
+M_{i,l} \approx \sum_{t \in O_i} (w_{i,t}+c)\nabla_{\theta_l}\log\pi_\theta(o_{i,t})\nabla_{\theta_l}\log\pi_\theta(o_{i,t})^T + \lambda_l I
+\end{equation}
+
+\subsection{Positive Definiteness via Damping}
+
+For $M_{i,l}$ to be positive definite, we require all eigenvalues to be positive. The smallest eigenvalue occurs in the direction of $\tilde{g}_{i,l}$:
+
+\begin{equation}
+\lambda_{\min}(M_{i,l}) = \|\tilde{g}_{i,l}\|^2 + \lambda_l
+\end{equation}
+
+Since $\|\tilde{g}_{i,l}\|^2 \geq 0$, choosing $\lambda_l > 0$ ensures positive definiteness.
+
+\textbf{Practical damping choice:}
+\begin{equation}
+\lambda_l = 0.1 \cdot \frac{1}{n d_l}\sum_{i=1}^n \|\tilde{g}_{i,l}\|^2
+\end{equation}
+
+This sets damping proportional to the average squared gradient magnitude.
+
+\subsection{Sherman-Morrison Inversion}
+
+For $M_{i,l} = \tilde{g}_{i,l}\tilde{g}_{i,l}^T + \lambda_l I$ (rank-one plus diagonal):
+
+\begin{equation}
+M_{i,l}^{-1} = \frac{1}{\lambda_l}\left(I - \frac{\tilde{g}_{i,l}\tilde{g}_{i,l}^T}{\lambda_l + \|\tilde{g}_{i,l}\|^2}\right)
+\end{equation}
+
+\textbf{Verification:} 
+\begin{align}
+M_{i,l} \cdot M_{i,l}^{-1} &= (\tilde{g}_{i,l}\tilde{g}_{i,l}^T + \lambda_l I) \cdot \frac{1}{\lambda_l}\left(I - \frac{\tilde{g}_{i,l}\tilde{g}_{i,l}^T}{\lambda_l + \|\tilde{g}_{i,l}\|^2}\right) \\
+&= \frac{1}{\lambda_l}\left[\tilde{g}_{i,l}\tilde{g}_{i,l}^T + \lambda_l I - \frac{(\tilde{g}_{i,l}\tilde{g}_{i,l}^T + \lambda_l I)\tilde{g}_{i,l}\tilde{g}_{i,l}^T}{\lambda_l + \|\tilde{g}_{i,l}\|^2}\right] \\
+&= \frac{1}{\lambda_l}\left[\tilde{g}_{i,l}\tilde{g}_{i,l}^T + \lambda_l I - \frac{\|\tilde{g}_{i,l}\|^2 \tilde{g}_{i,l}\tilde{g}_{i,l}^T + \lambda_l \tilde{g}_{i,l}\tilde{g}_{i,l}^T}{\lambda_l + \|\tilde{g}_{i,l}\|^2}\right] \\
+&= \frac{1}{\lambda_l}\left[\lambda_l I + \tilde{g}_{i,l}\tilde{g}_{i,l}^T\left(1 - \frac{\|\tilde{g}_{i,l}\|^2 + \lambda_l}{\lambda_l + \|\tilde{g}_{i,l}\|^2}\right)\right] \\
+&= I \quad \checkmark
+\end{align}
+
+\subsection{DataInf Swap Approximation}
+
+The core DataInf approximation:
+\begin{equation}
+\left(\frac{1}{n}\sum_{i=1}^n M_{i,l}\right)^{-1} \approx \frac{1}{n}\sum_{i=1}^n M_{i,l}^{-1}
+\end{equation}
+
+This avoids explicit inversion of the full $d_l \times d_l$ matrix, instead averaging per-sample inverses computed via Sherman-Morrison.
+
+\section{Influence Function Formula}
+
+\subsection{Complete Influence Derivation}
+
+The influence of training sample $k$ on the validation loss is:
+
+\begin{equation}
+\mathcal{I}(k) = -\sum_{l=1}^L v_l^T \left(\frac{1}{n}\sum_{i=1}^n M_{i,l}^{-1}\right) g_{k,l}
+\end{equation}
+
+Note carefully:
+\begin{itemize}
+    \item $v_l$: validation gradient
+    \item $M_{i,l}^{-1}$: uses $\tilde{g}_{i,l}$ (with square root trick) for Hessian
+    \item $g_{k,l}$: actual GRPO gradient of sample $k$ (with linear weight $w_{k,t}$)
+\end{itemize}
+
+Substituting Sherman-Morrison:
+\begin{align}
+\mathcal{I}(k) &= -\sum_{l=1}^L v_l^T \left[\frac{1}{n}\sum_{i=1}^n \frac{1}{\lambda_l}\left(I - \frac{\tilde{g}_{i,l}\tilde{g}_{i,l}^T}{\lambda_l + \|\tilde{g}_{i,l}\|^2}\right)\right] g_{k,l} \\
+&= -\sum_{l=1}^L \frac{1}{\lambda_l} v_l^T \left[\frac{1}{n}\sum_{i=1}^n \left(I - \frac{\tilde{g}_{i,l}\tilde{g}_{i,l}^T}{\lambda_l + \|\tilde{g}_{i,l}\|^2}\right)\right] g_{k,l} \\
+&= -\sum_{l=1}^L \frac{1}{\lambda_l} \left[\frac{1}{n}\sum_{i=1}^n v_l^T g_{k,l} - \frac{1}{n}\sum_{i=1}^n \frac{v_l^T \tilde{g}_{i,l} \tilde{g}_{i,l}^T g_{k,l}}{\lambda_l + \|\tilde{g}_{i,l}\|^2}\right] \\
+&= -\sum_{l=1}^L \frac{1}{\lambda_l} \left[v_l^T g_{k,l} - \frac{1}{n}\sum_{i=1}^n \frac{(v_l^T \tilde{g}_{i,l})(\tilde{g}_{i,l}^T g_{k,l})}{\lambda_l + \|\tilde{g}_{i,l}\|^2}\right]
+\end{align}
+
+\subsection{Scalar Notation}
+
+Define the following scalar quantities:
+
+\begin{align}
+L_{l,k} &= v_l^T g_{k,l} \quad \text{(validation · target GRPO gradient)} \\
+L_{l,i} &= v_l^T \tilde{g}_{i,l} \quad \text{(validation · Hessian construction gradient)} \\
+L_{l,ik} &= \tilde{g}_{i,l}^T g_{k,l} \quad \text{(Hessian gradient · target GRPO gradient)} \\
+L_{l,ii} &= \|\tilde{g}_{i,l}\|^2 \quad \text{(squared norm of Hessian gradient)}
+\end{align}
+
+\textbf{Notation note:} $L_{l,i}$ and $L_{l,ii}$ involve the modified gradient $\tilde{g}_{i,l}$ (for Hessian construction), while $L_{l,k}$ and $L_{l,ik}$ involve the actual loss gradient $g_{k,l}$.
+
+\subsection{Final Influence Formula}
+
+\begin{equation}\label{eq:final_influence}
+\boxed{
+\mathcal{I}(k) = \sum_{l=1}^L \frac{1}{\lambda_l}\left[\frac{1}{n}\sum_{i=1}^n \frac{L_{l,i} \cdot L_{l,ik}}{\lambda_l + L_{l,ii}} - L_{l,k}\right]
+}
+\end{equation}
+
+Expanding the components:
+\begin{equation}
+\mathcal{I}(k) = \sum_{l=1}^L \frac{1}{\lambda_l}\left[\frac{1}{n}\sum_{i=1}^n \frac{(v_l^T \tilde{g}_{i,l})(\tilde{g}_{i,l}^T g_{k,l})}{\lambda_l + \|\tilde{g}_{i,l}\|^2} - v_l^T g_{k,l}\right]
+\end{equation}
+
+\subsection{Computational Algorithm}
+
+\begin{algorithm}[H]
+\caption{Influence Computation for Linearized GRPO with DataInf}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} Model $\pi_\theta$, training data $\{(x_i, o_i, w_i)\}_{i=1}^n$, validation set $\mathcal{D}_{\mathrm{val}} = \{(x_j^{\mathrm{val}}, o_j^{\mathrm{val}})\}_{j=1}^M$
+\STATE \textbf{Output:} Influence scores $\{\mathcal{I}(i)\}_{i=1}^n$
+
+\STATE // Step 1: Compute constant c
+\STATE $c \leftarrow \max\{0, -\min_{i,t} w_{i,t}\}$
+
+\STATE // Step 2: Compute validation gradient (average over $M$ validation samples)
+\STATE $v_l \leftarrow \frac{1}{M}\sum_{j=1}^{M}\nabla_{\theta_l} \ell(x_j^{\mathrm{val}}, o_j^{\mathrm{val}})$ for each layer $l$
+
+\STATE // Step 3: Compute training gradients (both types, from one backward pass per sample)
+\FOR{$i = 1$ to $n$}
+    \STATE Run one backward pass for sample $i$; for each layer $l$ extract:
+    \STATE \hspace{1em} $\tilde{g}_{i,l}$: modified gradient with $\sqrt{w_{i,t}+c}$ coefficients \hspace{1em} (Hessian construction)
+    \STATE \hspace{1em} $g_{i,l}$: actual GRPO gradient with $-w_{i,t}$ coefficients \hspace{2.1em} (influence scoring)
+\ENDFOR
+
+\STATE // Step 4: Compute damping parameters
+\FOR{each layer $l$}
+    \STATE $\lambda_l \leftarrow 0.1 \cdot \frac{1}{n d_l}\sum_{i=1}^n \|\tilde{g}_{i,l}\|^2$
+\ENDFOR
+
+\STATE // Step 5: Compute influence for each training sample
+\FOR{$k = 1$ to $n$}
+    \STATE $\mathcal{I}(k) \leftarrow 0$
+    \FOR{each layer $l$}
+        \STATE $L_{l,k} \leftarrow v_l^T g_{k,l}$ \quad // validation · target gradient
+        \STATE $\text{weighted\_sum} \leftarrow 0$
+        \FOR{$i = 1$ to $n$}
+            \STATE $L_{l,i} \leftarrow v_l^T \tilde{g}_{i,l}$ \quad // validation · Hessian gradient
+            \STATE $L_{l,ik} \leftarrow \tilde{g}_{i,l}^T g_{k,l}$ \quad // Hessian gradient · target gradient
+            \STATE $L_{l,ii} \leftarrow \|\tilde{g}_{i,l}\|^2$ \quad // squared norm
+            \STATE $\text{weighted\_sum} \leftarrow \text{weighted\_sum} + \frac{L_{l,i} \cdot L_{l,ik}}{\lambda_l + L_{l,ii}}$
+        \ENDFOR
+        \STATE $\mathcal{I}(k) \leftarrow \mathcal{I}(k) + \frac{1}{\lambda_l}\left[\frac{1}{n}\text{weighted\_sum} - L_{l,k}\right]$
+    \ENDFOR
+\ENDFOR
+
+\STATE \textbf{return} $\{\mathcal{I}(i)\}_{i=1}^n$
+\end{algorithmic}
+\end{algorithm}
+
+
+
+
+
+\section{Implementation Notes}
+
+\begin{enumerate}
+    \item \textbf{Two gradients per sample:} We compute both $\tilde{g}_{i,l}$ (for Hessian) and $g_{i,l}$ (actual GRPO gradient) from a single backward pass per sample, using two different weighting schemes.
+
+    \item \textbf{Why different gradients?} The Hessian approximation uses $\sqrt{w_{i,t}+c}$ weighting to avoid squared weights, while the influence score requires the actual loss gradient with linear $-w_{i,t}$ weights.
+
+    \item \textbf{Computational cost:} Each training sample requires one backward pass, giving $n$ training backward passes plus $M$ validation backward passes, for $n + M$ total.
+
+    \item \textbf{Memory:} We store $\tilde{g}_{i,l}$ and $g_{i,l}$ for all training samples across all layers.
+\end{enumerate}
+
+
+\subsection{Interpretation}
+
+The influence score $\mathcal{I}(k)$ measures:
+
+\begin{itemize}
+    \item \textbf{Positive influence:} Training sample $k$ moves parameters in a direction that \emph{reduces} validation loss
+    \item \textbf{Negative influence:} Training sample $k$ moves parameters in a direction that \emph{increases} validation loss
+    \item \textbf{Magnitude:} Larger $|\mathcal{I}(k)|$ indicates stronger impact on validation performance
+\end{itemize}
+
+The formula captures:
+\begin{enumerate}
+    \item Direct alignment between target gradient and validation gradient (the $-L_{l,k}$ term)
+    \item Indirect effects through the Hessian curvature (the weighted sum term)
+    \item Proper weighting by the inverse Hessian eigenvalues (via $\lambda_l + L_{l,ii}$)
+\end{enumerate}
+
+
+
+
+\subsection{Key Assumptions}
+
+\begin{enumerate}
+    \item \textbf{Low-Rank Adaptation (LoRA):}  
+    The Hessian inverse approximation used in DataInf depends on the dimensionality of the parameter space. As the number of trainable parameters increases, the approximation error can grow significantly. Therefore, employing parameter-efficient methods such as LoRA, which restrict updates to a low-dimensional subspace, helps reduce this error and improves the reliability of the approximation.
+
+    \item \textbf{Extension to PPO and Related Methods:}  
+    The derivation presented here for GRPO can be extended, with minor modifications, to PPO and other similar policy-gradient-based optimization algorithms. Since these methods share a common structure involving probability ratios, advantages, and optional KL regularization, the same linearization and influence estimation framework can be adapted accordingly.
+\end{enumerate}
+
+
+
+
+
+
+
+
+
+% =========================== =========================== =========================== =========================== =========================== =========================== =========================== =========================== ===========================
+
+% \section{DataInf Approximation}
+
+% \subsection{Per-Sample Matrix (Practical Form)}
+
+% For each training sample $i$, we use:
+% \begin{equation}
+% M_{i,l} = \tilde{g}_{i,l}\tilde{g}_{i,l}^T + \lambda_l I
+% \end{equation}
+
+% where:
+% \begin{equation}
+% \tilde{g}_{i,l} = \sum_t \sqrt{w_{i,t}+c} \cdot \nabla_{\theta_l}\log\pi_\theta(o_{i,t}|o_{<t})
+% \end{equation}
+
+% This expands to (after dropping cross-terms):
+% \begin{equation}
+% M_{i,l} \approx \sum_t (w_{i,t}+c)\nabla_{\theta_l}\log\pi_\theta(o_{i,t})\nabla_{\theta_l}\log\pi_\theta(o_{i,t})^T + \lambda_l I
+% \end{equation}
+
+% \textbf{Note:} We accept that our weights are $(w_{i,t}+c)$ rather than pure $w_{i,t}$, trading theoretical purity for computational feasibility.
+
+
+
+
+% \subsection{Positive Definiteness via Adaptive Damping}
+
+% For $M_{i,l}$ to be positive definite, we need:
+% \begin{equation}
+% w_{i,t}\|\nabla_{\theta_l}\log\pi_\theta\|^2 + \lambda_l \geq 0 \quad \forall i,t
+% \end{equation}
+
+% For negative weights $w_{i,t} < 0$, we require:
+% \begin{equation}
+% \lambda_l \geq -w_{i,t}\|\nabla_{\theta_l}\log\pi_\theta\|^2
+% \end{equation}
+
+% \textbf{Adaptive damping strategy:}
+% \begin{equation}
+% \lambda_{i,l} = \max\left\{\lambda_{\text{min},l}, \max_t\left(-w_{i,t}\|\nabla_{\theta_l}\log\pi_\theta(o_{i,t}|o_{<t})\|^2\right) + \epsilon\right\}
+% \end{equation}
+
+% where $\epsilon > 0$ ensures strict positive definiteness.
+
+% \textbf{Alternative (simpler):} Use a single global damping per layer:
+% \begin{equation}
+% \lambda_l = c \cdot \frac{1}{md_l}\sum_{i,t}\|\nabla_{\theta_l}\log\pi_\theta(o_{i,t}|o_{<t})\|^2
+% \end{equation}
+
+% where $c$ is a scaling constant (e.g., $c=0.1$).
+
+% \subsection{Sherman-Morrison Inversion}
+
+% For $M_{i,l} = w_{i,t}gg^T + \lambda_l I$ where $g = \nabla_{\theta_l}\log\pi_\theta(o_{i,t}|o_{<t})$:
+
+% \begin{proposition}[Sherman-Morrison Formula]
+% \begin{equation}
+% M_{i,l}^{-1} = \frac{1}{\lambda_l}\left(I - \frac{w_{i,t}gg^T}{\lambda_l + w_{i,t}\|g\|^2}\right)
+% \end{equation}
+% \end{proposition}
+
+% \textbf{Proof:} Verify by multiplication:
+% \begin{align}
+% M_{i,l} \cdot M_{i,l}^{-1} &= (w_{i,t}gg^T + \lambda_l I)\left[\frac{1}{\lambda_l}\left(I - \frac{w_{i,t}gg^T}{\lambda_l + w_{i,t}\|g\|^2}\right)\right] \\
+% &= \frac{1}{\lambda_l}\left[(w_{i,t}gg^T + \lambda_l I) - \frac{w_{i,t}(w_{i,t}gg^T + \lambda_l I)gg^T}{\lambda_l + w_{i,t}\|g\|^2}\right] \\
+% &= \frac{1}{\lambda_l}\left[w_{i,t}gg^T + \lambda_l I - \frac{w_{i,t}^2\|g\|^2gg^T + \lambda_l w_{i,t}gg^T}{\lambda_l + w_{i,t}\|g\|^2}\right] \\
+% &= \frac{1}{\lambda_l}\left[\lambda_l I + w_{i,t}gg^T\left(1 - \frac{w_{i,t}\|g\|^2 + \lambda_l}{\lambda_l + w_{i,t}\|g\|^2}\right)\right] \\
+% &= I \quad \checkmark
+% \end{align}
+
+% \subsection{DataInf Swap Approximation}
+
+% The key DataInf approximation:
+% \begin{equation}
+% \left(\frac{1}{n}\sum_{i=1}^n M_{i,l}\right)^{-1} \approx \frac{1}{n}\sum_{i=1}^n M_{i,l}^{-1}
+% \end{equation}
+
+% This avoids explicit inversion of the full $d_l \times d_l$ matrix.
+
+
+
+% \section{Influence Function Formula}
+
+% \subsection{Test Gradient}
+
+% For validation sample with loss $\ell_{\text{val}}$:
+% \begin{equation}
+% v_l = \nabla_{\theta_l}\ell_{\text{val}}
+% \end{equation}
+
+% \subsection{Final Influence Formula (Practical)}
+
+% The influence of training sample $k$ on the validation loss:
+
+% \begin{equation}
+% \mathcal{I}(k) = -\sum_{l=1}^L v_l^T \left(\frac{1}{n}\sum_{i=1}^n M_{i,l}^{-1}\right) \tilde{g}_{k,l}
+% \end{equation}
+
+% where $M_{i,l} = \tilde{g}_{i,l}\tilde{g}_{i,l}^T + \lambda_l I$ and $\tilde{g}_{i,l} = \sum_t \sqrt{w_{i,t}+c} \nabla_{\theta_l}\log\pi_\theta(o_{i,t})$.
+
+% Substituting Sherman-Morrison formula:
+% \begin{equation}
+% M_{i,l}^{-1} = \frac{1}{\lambda_l}\left(I - \frac{\tilde{g}_{i,l}\tilde{g}_{i,l}^T}{\lambda_l + \|\tilde{g}_{i,l}\|^2}\right)
+% \end{equation}
+
+% we get:
+% \begin{equation}
+% \mathcal{I}(k) = -\sum_{l=1}^L v_l^T\left[\frac{1}{n}\sum_{i=1}^n \frac{1}{\lambda_l}\left(I - \frac{\tilde{g}_{i,l}\tilde{g}_{i,l}^T}{\lambda_l + \|\tilde{g}_{i,l}\|^2}\right)\right]\tilde{g}_{k,l}
+% \end{equation}
+
+% Simplifying with scalars:
+% \begin{itemize}
+%     \item $L_{l,i} = v_l^T \tilde{g}_{i,l}$ (test-train alignment)
+%     \item $L_{l,ik} = \tilde{g}_{i,l}^T \tilde{g}_{k,l}$ (train-train similarity)
+%     \item $L_{l,ii} = \|\tilde{g}_{i,l}\|^2$ (gradient magnitude)
+%     \item $L_{l,k} = v_l^T \tilde{g}_{k,l}$ (test-target alignment)
+% \end{itemize}
+
+% Final form:
+% \begin{equation}\label{eq:final_influence_practical}
+% \boxed{
+% \mathcal{I}(k) = \sum_{l=1}^L \frac{1}{\lambda_l}\left[\frac{1}{n}\sum_{i=1}^n \frac{L_{l,i}L_{l,ik}}{\lambda_l + L_{l,ii}} - L_{l,k}\right]
+% }
+% \end{equation}
+
+% \textbf{Note on weights:} The $L$ terms implicitly contain $(w_{i,t}+c)$ rather than pure $w_{i,t}$ due to our practical approximation. This introduces a small uniform bias that we accept for computational tractability.
+
+% \vspace{1.4em}
+
+% \textbf{With adaptive damping:}
+% \begin{equation}
+% \mathcal{I}(k) = \sum_{l=1}^L \left[\left(\frac{1}{n}\sum_{i=1}^n \frac{1}{\lambda_{i,l}}\right)L_{l,k} - \frac{1}{n}\sum_{i=1}^n \frac{w_{i,t}L_{l,i}L_{l,ik}}{\lambda_{i,l}(\lambda_{i,l} + w_{i,t}L_{l,ii})}\right]
+% \end{equation}
+% \vspace{4em}
+
+% \section{Implementation Algorithm}
+
+% \begin{algorithm}[H]
+% \caption{Influence Computation for Linearized GRPO}
+% \begin{algorithmic}[1]
+% \STATE \textbf{Input:} Model $\pi_\theta$, training data $\{(x_i, o_i, w_i)\}_{i=1}^n$, validation sample $(x_{\text{val}}, o_{\text{val}})$
+% \STATE \textbf{Output:} Influence scores $\{\mathcal{I}(i)\}_{i=1}^n$
+
+% \STATE // Compute validation gradient
+% \STATE $v_l \leftarrow \nabla_{\theta_l} \ell_{\text{val}}$ for each layer $l$
+
+% \STATE // Compute training gradients (requires 2 backprops per sample)
+% \FOR{$i = 1$ to $n$}
+%     \STATE $\tilde{g}_{i,l} \leftarrow \sum_t \sqrt{w_{i,t}+c} \cdot \nabla_{\theta_l}\log\pi_\theta(o_{i,t}|o_{<t})$
+%     \STATE $g_{2,i,l} \leftarrow \sum_t \nabla_{\theta_l}\log\pi_\theta(o_{i,t}|o_{<t})$
+%     \STATE $\tilde{g}_{i,l} \leftarrow \sqrt{w_{i,t}} \cdot \nabla_{\theta_l}\log\pi_\theta(o_{i,t}|o_{<t})$ (effective gradient)
+% \ENDFOR
+
+% \STATE // Compute adaptive damping (optional)
+% \FOR{each layer $l$}
+%     \STATE $\lambda_l \leftarrow c \cdot \frac{1}{md_l}\sum_{i,t}\|\tilde{g}_{i,l}\|^2$
+% \ENDFOR
+
+% \STATE // Compute influence for each training sample
+% \FOR{$k = 1$ to $n$}
+%     \STATE $\mathcal{I}(k) \leftarrow 0$
+%     \FOR{each layer $l$}
+%         \STATE $L_{l,k} \leftarrow v_l^T \tilde{g}_{k,l}$
+%         \STATE $\text{weighted\_sum} \leftarrow 0$
+%         \FOR{$i = 1$ to $n$}
+%             \STATE $L_{l,i} \leftarrow v_l^T \tilde{g}_{i,l}$
+%             \STATE $L_{l,ik} \leftarrow \tilde{g}_{i,l}^T \tilde{g}_{k,l}$
+%             \STATE $L_{l,ii} \leftarrow \|\tilde{g}_{i,l}\|^2$
+%             \STATE $\text{weighted\_sum} \leftarrow \text{weighted\_sum} + \frac{w_{i,t}L_{l,i}L_{l,ik}}{\lambda_l + w_{i,t}L_{l,ii}}$
+%         \ENDFOR
+%         \STATE $\mathcal{I}(k) \leftarrow \mathcal{I}(k) + \frac{1}{\lambda_l}\left[\frac{1}{n}\text{weighted\_sum} - L_{l,k}\right]$
+%     \ENDFOR
+% \ENDFOR
+% \STATE \textbf{return} $\{\mathcal{I}(i)\}_{i=1}^n$
+% \end{algorithmic}
+% \end{algorithm}
+% \vspace{1.4em}
+
+% \section{Summary and Key Contributions}
+
+% \begin{enumerate}
+%     \item \textbf{Linearization:} We linearized the GRPO loss by (a) using masking for the min-clipped term and (b) Taylor expansion for small policy updates
+    
+%     \item \textbf{Linear weights in Hessian:} Via the two-gradient trick, we achieved $w_{i,t}$ (linear) rather than $w_{i,t}^2$ (squared) in the empirical Hessian
+    
+%     \item \textbf{Cross-term elimination:} Token-level gradient independence allows dropping cross-terms, simplifying the Hessian to a sum of per-token contributions
+    
+%     \item \textbf{Adaptive damping:} Per-sample or per-layer damping ensures positive definiteness even with negative advantage weights
+    
+%     \item \textbf{Closed-form computation:} Sherman-Morrison provides $O(d)$ inversion, enabling practical DataInf application to large language models
+% \end{enumerate}
+
+
+
+% \section{Key Assumptions}
+
+% \begin{enumerate}
+%     \item \textbf{Low-Rank Adaptation (LoRA):}  
+%     The Hessian inverse approximation used in DataInf depends on the dimensionality of the parameter space. As the number of trainable parameters increases, the approximation error can grow significantly. Therefore, employing parameter-efficient methods such as LoRA, which restrict updates to a low-dimensional subspace, helps reduce this error and improves the reliability of the approximation.
+
+%     \item \textbf{Extension to PPO and Related Methods:}  
+%     The derivation presented here for GRPO can be extended, with minor modifications, to PPO and other similar policy-gradient-based optimization algorithms. Since these methods share a common structure involving probability ratios, advantages, and optional KL regularization, the same linearization and influence estimation framework can be adapted accordingly.
+% \end{enumerate}
+
+
+
+
+
+
+
+\end{document}

@@ -186,6 +186,18 @@ class PPOConfig(object):
             "help": "Run a sanity check on per-sample grad calculations"
         },
     )
+    datainf_damping_scale: Optional[float] = field(
+        default=0.1,
+        metadata={"help": "Scaling constant c_lambda for adaptive per-layer damping in DataInf"},
+    )
+    datainf_percentile: Optional[float] = field(
+        default=5.0,
+        metadata={"help": "Percentile p for weight clipping in DataInf (e.g., 5 means bottom 5% excluded)"},
+    )
+    datainf_eps: Optional[float] = field(
+        default=1e-8,
+        metadata={"help": "Positivity buffer epsilon for the shift constant c in DataInf"},
+    )
 
     def __post_init__(self):
         if self.forward_batch_size is not None:
