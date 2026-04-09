@@ -2269,11 +2269,13 @@ class PPOTrainer(BaseTrainer):
         train_gBs = {k: torch.cat(v) for k, v in self._gBs.items()}
         timing["time/ppo/datainf_concat_train"] = time.time() - t
 
-        # Consolidate batch_dict
+        # Consolidate batch_dict (same rule as step_with_validation):
+        # Only cat tensor micro-batches (len < bs). Keep queries/responses as
+        # lists of per-sample tensors — catting them would flatten into one 1D
+        # tensor and break batched_forward_pass (len() of 0-d tensor).
         for k in batch_dict.keys():
-            if isinstance(batch_dict[k], list) and len(batch_dict[k]) > 0:
-                if isinstance(batch_dict[k][0], torch.Tensor):
-                    batch_dict[k] = torch.cat(batch_dict[k], dim=0)
+            if len(batch_dict[k]) < bs:
+                batch_dict[k] = torch.cat(batch_dict[k], dim=0)
 
         # ==================================================================
         #  PHASE 2: Compute effective weights w_i + percentile clipping
