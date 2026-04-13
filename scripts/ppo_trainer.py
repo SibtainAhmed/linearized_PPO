@@ -2104,10 +2104,13 @@ class PPOTrainer(BaseTrainer):
         with the DataInf formula (Sherman–Morrison on per-sample Hessians).
 
         Key differences from step_with_validation:
-          1. Ghost backward uses UNWEIGHTED log-prob loss  →  base gradient h_{i,l}
+          1. TWO ghost backward passes per training mini-batch:
+             a) UNWEIGHTED log-prob loss  →  base gradient h_{i,l} for Hessian (PSD)
+             b) FULL PPO loss (token-level advantages, ratio, value fn) → g_k^{PPO}
+                for the loss gradient term in the influence formula
           2. Effective weights w_i are computed explicitly; percentile-clipped
           3. Influence is computed via compute_datainf_influence (Gram matrix +
-             Sherman–Morrison), not a simple inner product
+             Sherman–Morrison with cross-gram), not a simple inner product
         """
         bs = self.config.batch_size
 
@@ -2171,10 +2174,17 @@ class PPOTrainer(BaseTrainer):
         timing["time/ppo/forward_pass"] = 0.0
         timing["time/ppo/compute_rewards"] = 0.0
         timing["time/ppo/compute_advantages"] = 0.0
-        timing["time/ppo/ghost_backward"] = 0.0
+        timing["time/ppo/ghost_backward_base"] = 0.0
+        timing["time/ppo/ghost_backward_ppo"] = 0.0
+
+        # Accumulators for Hessian (base/unweighted) gradient factors
+        hessian_gAs_accum = {}
+        hessian_gBs_accum = {}
 
         # ==================================================================
-        #  PHASE 1: Forward pass + ghost backward (unweighted) for ALL N
+        #  PHASE 1: Forward pass + TWO ghost backward passes for ALL N
+        #    1a) UNWEIGHTED log-prob backward  →  h_{i,l}  (for Hessian, PSD)
+        #    1b) FULL PPO loss backward         →  g_k^{PPO} (for influence)
         # ==================================================================
         for tb_start in range(0, bs, self.config.tracin_batch_size):
             tb_end = tb_start + self.config.tracin_batch_size
@@ -2249,15 +2259,46 @@ class PPOTrainer(BaseTrainer):
             tb_dict.update(tb_inputs)
             update_into_batch_dict(tb_dict, batch_dict)
 
-            # Ghost backward on UNWEIGHTED log-prob loss → captures gAs, gBs
+            # --- Ghost backward #1: UNWEIGHTED log-prob (for Hessian h_i) ---
             t = time.time()
             unweighted_loss = -(tb_logprobs.to(torch.float32) * tb_masks.detach().float()).sum()
             self._record_ghost = True
             with ghost_mode(self.optimizer):
-                self.accelerator.backward(unweighted_loss)
+                self.accelerator.backward(unweighted_loss, retain_graph=True)
             self.optimizer.zero_grad()
             self._record_ghost = False
-            timing["time/ppo/ghost_backward"] += time.time() - t
+            timing["time/ppo/ghost_backward_base"] += time.time() - t
+
+            # Save hessian gradient factors from this mini-batch
+            for name in self._gAs:
+                if name not in hessian_gAs_accum:
+                    hessian_gAs_accum[name] = []
+                    hessian_gBs_accum[name] = []
+                hessian_gAs_accum[name].extend(self._gAs[name])
+                hessian_gBs_accum[name].extend(self._gBs[name])
+
+            # Clear gAs/gBs so PPO backward fills them cleanly
+            for name in self._gAs:
+                self._gAs[name] = []
+                self._gBs[name] = []
+
+            # --- Ghost backward #2: FULL PPO loss (for influence g_k^{PPO}) ---
+            t = time.time()
+            self._record_ghost = True
+            with ghost_mode(self.optimizer):
+                self.train_minibatch(
+                    tb_logprobs.detach(),
+                    tb_values_upd.detach(),
+                    tb_logprobs,
+                    tb_logits,
+                    tb_values,
+                    tb_masks.detach(),
+                    tb_advantages,
+                    tb_returns,
+                )
+            self.optimizer.zero_grad()
+            self._record_ghost = False
+            timing["time/ppo/ghost_backward_ppo"] += time.time() - t
 
             t = time.time()
 
@@ -2265,8 +2306,10 @@ class PPOTrainer(BaseTrainer):
         t = time.time()
         train_xs = {k: torch.cat(v) for k, v in self._xs.items()}
         train_hs = {k: torch.cat(v) for k, v in self._hs.items()}
-        train_gAs = {k: torch.cat(v) for k, v in self._gAs.items()}
-        train_gBs = {k: torch.cat(v) for k, v in self._gBs.items()}
+        ppo_gAs = {k: torch.cat(v) for k, v in self._gAs.items()}
+        ppo_gBs = {k: torch.cat(v) for k, v in self._gBs.items()}
+        hessian_gAs = {k: torch.cat(v) for k, v in hessian_gAs_accum.items()}
+        hessian_gBs = {k: torch.cat(v) for k, v in hessian_gBs_accum.items()}
         timing["time/ppo/datainf_concat_train"] = time.time() - t
 
         # Consolidate batch_dict (same rule as step_with_validation):
@@ -2306,9 +2349,11 @@ class PPOTrainer(BaseTrainer):
         # Subset training ghost factors to retained samples
         ret_xs  = {k: v[retained_ids] for k, v in train_xs.items()}
         ret_hs  = {k: v[retained_ids] for k, v in train_hs.items()}
-        ret_gAs = {k: v[retained_ids] for k, v in train_gAs.items()}
-        ret_gBs = {k: v[retained_ids] for k, v in train_gBs.items()}
-        del train_xs, train_hs, train_gAs, train_gBs
+        ret_hessian_gAs = {k: v[retained_ids] for k, v in hessian_gAs.items()}
+        ret_hessian_gBs = {k: v[retained_ids] for k, v in hessian_gBs.items()}
+        ret_ppo_gAs = {k: v[retained_ids] for k, v in ppo_gAs.items()}
+        ret_ppo_gBs = {k: v[retained_ids] for k, v in ppo_gBs.items()}
+        del train_xs, train_hs, hessian_gAs, hessian_gBs, ppo_gAs, ppo_gBs
 
         timing["time/ppo/datainf_weights"] = time.time() - t
 
@@ -2442,12 +2487,14 @@ class PPOTrainer(BaseTrainer):
         # ==================================================================
         t = time.time()
         ghost_ip = self.compute_datainf_influence(
-            ret_xs, ret_hs, ret_gAs, ret_gBs,
+            ret_xs, ret_hs,
+            ret_hessian_gAs, ret_hessian_gBs,
+            ret_ppo_gAs, ret_ppo_gBs,
             val_S_A, val_S_B, w_retained, c_shift, N_star,
         )
         timing["time/ppo/datainf_influence"] = time.time() - t
         print("[DataInf] Influence scores:", ghost_ip[:10], "...")
-        del ret_xs, ret_hs, ret_gAs, ret_gBs
+        del ret_xs, ret_hs, ret_hessian_gAs, ret_hessian_gBs, ret_ppo_gAs, ret_ppo_gBs
 
         # ==================================================================
         #  PHASE 5: Save & filter
@@ -3560,77 +3607,72 @@ class PPOTrainer(BaseTrainer):
 
 
 
-    def compute_datainf_influence(self, train_xs, train_hs, train_gAs, train_gBs,
+    def compute_datainf_influence(self, train_xs, train_hs,
+                                   hessian_gAs, hessian_gBs,
+                                   ppo_gAs, ppo_gBs,
                                    val_S_A, val_S_B, w_retained, c, N_star):
         """
         Compute per-sample DataInf influence scores using the Sherman-Morrison
-        formula on ghost gradient factors (Kronecker-factored LoRA gradients).
+        formula with TWO separate gradient sets:
 
-        All inner products exploit the Kronecker structure:
-          grad_A_i = gAs_i^T @ xs_i   →  [r, d_in]    (block A)
-          grad_B_i = gBs_i^T @ hs_i   →  [d_out, r]   (block B)
-        avoiding materialization of full d_l-dimensional gradients.
+          - hessian_gAs/gBs: from UNWEIGHTED log-prob backward → base gradients
+            h_{i,l} used for Hessian approximation (PSD guaranteed).
+          - ppo_gAs/gBs: from FULL PPO loss backward → PPO gradients g_k^{PPO}
+            used as the loss gradient in the influence formula.
 
-        Args:
-            train_xs/hs/gAs/gBs: dicts  {layer_name: [N, S, d]} of ghost factors
-                for ALL training samples (retained indexing handled here).
-            val_S_A/val_S_B: dicts  {layer_name: [r, d_in] / [d_out, r]} of the
-                averaged validation gradient in factored form.
-            w_retained: [N*] tensor of effective weights for retained samples.
-            c: float, the shift constant.
-            N_star: int, number of retained samples.
-
-        Returns:
-            influence: np.ndarray of shape [N*], the DataInf influence score
-                for each retained training sample.
+        The influence formula is:
+          I(k) = -sum_l (1/λ_l) [v^T g_k^{PPO} - (1/N*) sum_i α_i (h_i^T g_k^{PPO})]
+        where α_i = (w_i+c)(v^T h_i) / (λ_l + L_{l,ii}) uses base gradients,
+        and the cross-gram h_i^T g_k^{PPO} mixes base and PPO gradients.
         """
         device = w_retained.device
         influence = torch.zeros(N_star, device=device, dtype=torch.float32)
 
         for name in train_xs:
-            xs = train_xs[name].to(torch.float32)    # [N*, S, d_in]
-            hs = train_hs[name].to(torch.float32)    # [N*, S, r]
-            gAs = train_gAs[name].to(torch.float32)  # [N*, S, r]
-            gBs = train_gBs[name].to(torch.float32)  # [N*, S, d_out]
+            xs = train_xs[name].to(torch.float32)
+            hs = train_hs[name].to(torch.float32)
+            h_gAs = hessian_gAs[name].to(torch.float32)
+            h_gBs = hessian_gBs[name].to(torch.float32)
+            p_gAs = ppo_gAs[name].to(torch.float32)
+            p_gBs = ppo_gBs[name].to(torch.float32)
 
-            # --- per-sample factored gradient: P_A[i] = gAs_i^T @ xs_i ---
-            P_A = torch.matmul(gAs.transpose(1, 2), xs)   # [N*, r, d_in]
-            P_B = torch.matmul(gBs.transpose(1, 2), hs)   # [N*, d_out, r]
+            # --- Base (Hessian) per-sample factored gradients ---
+            base_P_A = torch.matmul(h_gAs.transpose(1, 2), xs)   # [N*, r, d_in]
+            base_P_B = torch.matmul(h_gBs.transpose(1, 2), hs)   # [N*, d_out, r]
+            base_A_flat = base_P_A.reshape(N_star, -1)             # [N*, r*d_in]
+            base_B_flat = base_P_B.reshape(N_star, -1)             # [N*, d_out*r]
 
-            P_A_flat = P_A.reshape(N_star, -1)  # [N*, r*d_in]
-            P_B_flat = P_B.reshape(N_star, -1)  # [N*, d_out*r]
+            # --- PPO per-sample factored gradients ---
+            ppo_P_A = torch.matmul(p_gAs.transpose(1, 2), xs)    # [N*, r, d_in]
+            ppo_P_B = torch.matmul(p_gBs.transpose(1, 2), hs)    # [N*, d_out, r]
+            ppo_A_flat = ppo_P_A.reshape(N_star, -1)
+            ppo_B_flat = ppo_P_B.reshape(N_star, -1)
 
-            # --- base-gradient Gram matrix: Gram[i,k] = h_i^T h_k ---
-            Gram = (P_A_flat @ P_A_flat.T) + (P_B_flat @ P_B_flat.T)  # [N*, N*]
+            # --- Hessian quantities (from base gradients only) ---
+            base_norms = (base_A_flat ** 2).sum(dim=1) + (base_B_flat ** 2).sum(dim=1)
+            d_l = base_A_flat.shape[1] + base_B_flat.shape[1]
 
-            # --- base-gradient self-norms ---
-            norms = Gram.diag()  # [N*]
+            w_plus_c = w_retained + c
+            L_ii = w_plus_c * base_norms
 
-            # --- validation IP: val_ip[k] = v_l^T h_{k,l} ---
-            v_A = val_S_A[name].to(torch.float32)  # [r, d_in]
-            v_B = val_S_B[name].to(torch.float32)  # [d_out, r]
-            val_ip = (P_A * v_A).sum(dim=(1, 2)) + (P_B * v_B).sum(dim=(1, 2))  # [N*]
-
-            # --- layer dimension ---
-            d_l = P_A_flat.shape[1] + P_B_flat.shape[1]  # r*d_in + d_out*r
-
-            # --- L_{l,ii} = (w_i + c) * ||h_i||^2 ---
-            w_plus_c = w_retained + c  # [N*]
-            L_ii = w_plus_c * norms    # [N*]
-
-            # --- adaptive damping: lambda_l = c_lambda / (N* d_l) * sum L_ii ---
             lambda_l = self.config.datainf_damping_scale * L_ii.sum() / (N_star * d_l)
             lambda_l = max(lambda_l.item(), 1e-12)
 
-            # --- DataInf vectorised formula ---
-            # alpha_i = (w_i+c) * val_ip[i] / (lambda_l + L_ii[i])
-            alpha = w_plus_c * val_ip / (lambda_l + L_ii)  # [N*]
+            # --- Validation inner products ---
+            v_A = val_S_A[name].to(torch.float32)
+            v_B = val_S_B[name].to(torch.float32)
+            val_base_ip = (base_P_A * v_A).sum(dim=(1, 2)) + (base_P_B * v_B).sum(dim=(1, 2))
+            val_ppo_ip = (ppo_P_A * v_A).sum(dim=(1, 2)) + (ppo_P_B * v_B).sum(dim=(1, 2))
 
-            # gram_sum[k] = sum_i alpha_i * Gram[i,k]
-            gram_sum = alpha @ Gram  # [N*]
+            # --- Sherman-Morrison correction (Hessian eigenvectors from base grads) ---
+            alpha = w_plus_c * val_base_ip / (lambda_l + L_ii)
 
-            # I_l(k) = (-w_k / lambda_l) * (gram_sum[k] / N* - val_ip[k])
-            influence_l = (-w_retained / lambda_l) * (gram_sum / N_star - val_ip)
+            # Cross-gram: base[i] · PPO[k]
+            cross_gram = (base_A_flat @ ppo_A_flat.T) + (base_B_flat @ ppo_B_flat.T)
+            correction = alpha @ cross_gram   # [N*]
+
+            # I_l(k) = -(1/λ) [v^T g_k^{PPO} - correction_k / N*]
+            influence_l = (-1.0 / lambda_l) * (val_ppo_ip - correction / N_star)
             influence += influence_l
 
         return [x.item() for x in influence]

@@ -26,8 +26,8 @@ accelerate launch --main_process_port=29524 \
     --wandb_project="ppo-detox" \
     --run_name="datainf-2.7b-bfloat16-kl-0.04-val-1024_seed-22" \
     --datainf \
-    --datainf_damping_scale=0.1 \
-    --datainf_percentile=5.0 \
+    --datainf_damping_scale=1.0 \
+    --datainf_percentile=2.0 \
     --datainf_eps=1e-8 \
     --val_loss_type="seqloss-lastadv" \
     --gen_data_dir="gen_tox_datainf_2.7b_bfloat16_kl-0.04_val-1024_seed-22"

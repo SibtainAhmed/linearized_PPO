@@ -142,8 +142,8 @@ class ScriptArguments:
     val_strategy: Optional[str] = field(default="random", metadata={"help": "rollout strategy, start with high var, high mean, etc"})
     gen_data_dir: Optional[str] = field(default=None, metadata={"help": "directory to save generated data"})
     datainf: Optional[bool] = field(default=False, metadata={"help": "whether to use DataInf influence for sample selection"})
-    datainf_damping_scale: Optional[float] = field(default=0.1, metadata={"help": "c_lambda for DataInf adaptive damping"})
-    datainf_percentile: Optional[float] = field(default=5.0, metadata={"help": "percentile p for DataInf weight clipping"})
+    datainf_damping_scale: Optional[float] = field(default=1.0, metadata={"help": "c_lambda for DataInf adaptive damping"})
+    datainf_percentile: Optional[float] = field(default=2.0, metadata={"help": "percentile p for DataInf weight clipping"})
     datainf_eps: Optional[float] = field(default=1e-8, metadata={"help": "epsilon for DataInf shift constant positivity"})
 
 DEFAULT_PAD_TOKEN = "[PAD]"
