@@ -2314,6 +2314,8 @@ class PPOTrainer(BaseTrainer):
 
         # ==================================================================
         #  PHASE 3: Validation ghost backward → accumulated val gradient
+        #  Uses the SAME validation loss as IIF (val_loss_type config),
+        #  incorporating reward/advantage signal into v_l.
         # ==================================================================
         t = time.time()
         val_S_A = {}   # {name: [r, d_in]}  averaged validation gradient (block A)
@@ -2332,19 +2334,81 @@ class PPOTrainer(BaseTrainer):
             vb_inputs = {k: val_model_inputs[k][vb_inds] for k in model_inputs_names}
             vb_queries = [val_queries[idx] for idx in vb_inds]
             vb_responses = [val_responses[idx] for idx in vb_inds]
+            vb_scores = [val_scores[idx] for idx in vb_inds]
 
-            # Forward WITH hooks
+            # Forward WITH hooks (captures xs, hs for validation)
             self._record_ghost = True
-            vb_logprobs, _, _, vb_masks = self.batched_forward_pass(
+            vb_logprobs, vb_logits, vb_values, vb_masks = self.batched_forward_pass(
                 self.model, vb_queries, vb_responses, vb_inputs,
-                return_logits=False,
+                return_logits=True,
                 batch_forward_batch_size=self.config.tracin_val_batch_size,
             )
             self._record_ghost = False
 
-            # Validation loss: plain log-prob (no PPO weighting)
-            val_loss = -(vb_logprobs.to(torch.float32) * vb_masks.detach().float()).sum()
+            # Ref logprobs for validation (same pattern as IIF)
+            with torch.no_grad():
+                with self.accelerator.unwrap_model(self.model).pretrained_model.disable_adapter():
+                    vb_ref_logprobs, vb_ref_logits, _, _ = self.batched_forward_pass(
+                        self.model, vb_queries, vb_responses, vb_inputs,
+                        return_logits=full_kl_penalty,
+                        batch_forward_batch_size=self.config.tracin_val_batch_size,
+                    )
 
+                if full_kl_penalty:
+                    vb_active_full = logprobs_from_logits(vb_logits.detach(), None, gather=False)
+                    vb_ref_full = logprobs_from_logits(vb_ref_logits, None, gather=False)
+                    vb_rewards, _ = self.compute_rewards(
+                        vb_scores, vb_active_full, vb_ref_full, vb_masks.detach()
+                    )
+                else:
+                    vb_rewards, _ = self.compute_rewards(
+                        vb_scores, vb_logprobs.detach(), vb_ref_logprobs, vb_masks.detach()
+                    )
+
+                _, vb_advantages, _ = self.compute_advantages(
+                    vb_values.detach(), vb_rewards, vb_masks.detach()
+                )
+
+            # Compute validation loss using the same val_loss_type as IIF
+            if self.config.val_loss_type == 'sample-level-orig':
+                masked_term = vb_advantages * vb_logprobs.to(torch.float32) * vb_masks.detach()
+                per_sample_num = vb_masks.sum(dim=1).clamp(min=1)
+                per_sample_sum = masked_term.sum(dim=1)
+                per_sample_loss = -per_sample_sum / per_sample_num
+                val_loss = per_sample_loss.mean()
+
+            elif self.config.val_loss_type == 'logprob':
+                masked_term = vb_logprobs.to(torch.float32) * vb_masks.detach()
+                per_sample_num = vb_masks.sum(dim=1).clamp(min=1)
+                per_sample_sum = masked_term.sum(dim=1)
+                per_sample_loss = -per_sample_sum / per_sample_num
+                val_loss = per_sample_loss.mean()
+
+            elif self.config.val_loss_type == 'rough-orig':
+                val_loss = -torch.mean(
+                    vb_advantages * vb_logprobs.to(torch.float32) * vb_masks.detach()
+                )
+
+            elif self.config.val_loss_type == 'seqloss-reward':
+                seq_logprob = (vb_logprobs.to(torch.float32) * vb_masks.detach()).sum(dim=1)
+                seq_score = torch.stack(vb_scores)
+                val_loss = (-seq_logprob * seq_score).mean()
+
+            elif self.config.val_loss_type == 'seqloss-lastadv':
+                seq_logprob = (vb_logprobs.to(torch.float32) * vb_masks.detach()).sum(dim=1)
+                indices = (torch.argmax(vb_masks.detach(), dim=1)
+                           + torch.sum(vb_masks.detach(), dim=1) - 1)
+                seq_score = vb_advantages[torch.arange(vb_advantages.size(0)), indices]
+                val_loss = (-seq_logprob * seq_score).mean()
+
+            else:
+                raise NotImplementedError(
+                    f"Validation loss type {self.config.val_loss_type} not implemented."
+                )
+
+            print(f'[DataInf] val_loss ({self.config.val_loss_type}): {val_loss.item():.4f}')
+
+            # Ghost backward on validation loss (captures gAs, gBs)
             self._record_ghost = True
             self.accelerator.backward(val_loss)
             self._record_ghost = False
