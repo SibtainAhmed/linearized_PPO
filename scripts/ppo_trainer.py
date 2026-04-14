@@ -1797,19 +1797,24 @@ class PPOTrainer(BaseTrainer):
             print('random ghost ip sampled')
         
         else:
-            for tracin_batch_start in range(0, self.config.val_size, self.config.tracin_val_batch_size):
+            n_val_swv = int(val_model_inputs["input_ids"].shape[0])
+            val_in_keys_swv = list(val_model_inputs.keys())
+            vbs = self.config.tracin_val_batch_size
+            for tracin_batch_start in range(0, n_val_swv, vbs):
                     
                 for buf in (self._xs, self._hs, self._gAs, self._gBs, self._vxs, self._vgs, self._bgs):
                     for name in buf: buf[name] = []
 
-                tracin_batch_end = tracin_batch_start + self.config.tracin_val_batch_size
-                tracin_batch_inds = np.arange(tracin_batch_start, tracin_batch_end)
+                tracin_batch_end = min(tracin_batch_start + vbs, n_val_swv)
 
-                val_tracin_model_inputs = {k: val_model_inputs[k][tracin_batch_inds] for k in model_inputs_names}
+                val_tracin_model_inputs = {
+                    k: val_model_inputs[k][tracin_batch_start:tracin_batch_end]
+                    for k in val_in_keys_swv
+                }
 
-                val_tracin_queries = [val_queries[idx] for idx in tracin_batch_inds]
-                val_tracin_responses = [val_responses[idx] for idx in tracin_batch_inds]
-                val_tracin_scores = [val_scores[idx] for idx in tracin_batch_inds]
+                val_tracin_queries = val_queries[tracin_batch_start:tracin_batch_end]
+                val_tracin_responses = val_responses[tracin_batch_start:tracin_batch_end]
+                val_tracin_scores = val_scores[tracin_batch_start:tracin_batch_end]
                 
                 self._record_ghost = True
                 val_all_logprobs, val_logits_or_none, val_values, val_masks = self.batched_forward_pass(
@@ -1876,8 +1881,13 @@ class PPOTrainer(BaseTrainer):
                 
                 elif self.config.val_loss_type == 'seqloss-lastadv':
                     seq_logprob = (val_all_logprobs.to(torch.float32) * val_masks.detach()).sum(dim=1)
-                    indices = torch.argmax(val_masks.detach(), dim=1) + torch.sum(val_masks.detach(), dim=1) - 1
-                    seq_score = val_advantages[torch.arange(val_advantages.size(0)), indices]
+                    vm = val_masks.detach()
+                    indices = torch.argmax(vm, dim=1) + torch.sum(vm, dim=1) - 1
+                    ali = val_advantages.size(1)
+                    indices = indices.clamp(min=0, max=max(ali - 1, 0))
+                    seq_score = val_advantages[
+                        torch.arange(val_advantages.size(0), device=val_advantages.device), indices
+                    ]
                     per_seq_loss = - seq_logprob * seq_score
                     validation_loss = per_seq_loss.mean()
                     print('validation loss (sequence-level-score-last-adv) in ghost calculation', validation_loss)
@@ -2365,21 +2375,27 @@ class PPOTrainer(BaseTrainer):
         t = time.time()
         val_S_A = {}   # {name: [r, d_in]}  averaged validation gradient (block A)
         val_S_B = {}   # {name: [d_out, r]}  averaged validation gradient (block B)
-        M = self.config.val_size
+        # Use actual val batch dim — must not index val with train's model_inputs keys alone
+        # (train tensors are batch_size-wide; mixing keys can yield dim0=bs and OOB for vb_inds≥bs).
+        n_val = int(val_model_inputs["input_ids"].shape[0])
+        val_input_keys = list(val_model_inputs.keys())
+        M = n_val
 
-        for vb_start in range(0, M, self.config.tracin_val_batch_size):
+        vb_chunk = self.config.tracin_val_batch_size
+        for vb_start in range(0, n_val, vb_chunk):
             for buf in (self._xs, self._hs, self._gAs, self._gBs,
                         self._vxs, self._vgs, self._bgs):
                 for name in buf:
                     buf[name] = []
 
-            vb_end = vb_start + self.config.tracin_val_batch_size
-            vb_inds = np.arange(vb_start, vb_end)
+            vb_end = min(vb_start + vb_chunk, n_val)
 
-            vb_inputs = {k: val_model_inputs[k][vb_inds] for k in model_inputs_names}
-            vb_queries = [val_queries[idx] for idx in vb_inds]
-            vb_responses = [val_responses[idx] for idx in vb_inds]
-            vb_scores = [val_scores[idx] for idx in vb_inds]
+            vb_inputs = {
+                k: val_model_inputs[k][vb_start:vb_end] for k in val_input_keys
+            }
+            vb_queries = val_queries[vb_start:vb_end]
+            vb_responses = val_responses[vb_start:vb_end]
+            vb_scores = val_scores[vb_start:vb_end]
 
             # Forward WITH hooks (captures xs, hs for validation)
             self._record_ghost = True
@@ -2441,9 +2457,13 @@ class PPOTrainer(BaseTrainer):
 
             elif self.config.val_loss_type == 'seqloss-lastadv':
                 seq_logprob = (vb_logprobs.to(torch.float32) * vb_masks.detach()).sum(dim=1)
-                indices = (torch.argmax(vb_masks.detach(), dim=1)
-                           + torch.sum(vb_masks.detach(), dim=1) - 1)
-                seq_score = vb_advantages[torch.arange(vb_advantages.size(0)), indices]
+                m = vb_masks.detach()
+                indices = torch.argmax(m, dim=1) + torch.sum(m, dim=1) - 1
+                ali = vb_advantages.size(1)
+                indices = indices.clamp(min=0, max=max(ali - 1, 0))
+                seq_score = vb_advantages[
+                    torch.arange(vb_advantages.size(0), device=vb_advantages.device), indices
+                ]
                 val_loss = (-seq_logprob * seq_score).mean()
 
             else:
