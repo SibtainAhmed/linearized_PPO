@@ -1797,9 +1797,9 @@ class PPOTrainer(BaseTrainer):
             print('random ghost ip sampled')
         
         else:
-            n_val_swv = int(val_model_inputs["input_ids"].shape[0])
-            val_in_keys_swv = list(val_model_inputs.keys())
+            n_val_swv = len(val_queries)
             vbs = self.config.tracin_val_batch_size
+            pad_first_swv = self.tokenizer.padding_side == "left"
             for tracin_batch_start in range(0, n_val_swv, vbs):
                     
                 for buf in (self._xs, self._hs, self._gAs, self._gBs, self._vxs, self._vgs, self._bgs):
@@ -1807,14 +1807,24 @@ class PPOTrainer(BaseTrainer):
 
                 tracin_batch_end = min(tracin_batch_start + vbs, n_val_swv)
 
-                val_tracin_model_inputs = {
-                    k: val_model_inputs[k][tracin_batch_start:tracin_batch_end]
-                    for k in val_in_keys_swv
-                }
-
                 val_tracin_queries = val_queries[tracin_batch_start:tracin_batch_end]
                 val_tracin_responses = val_responses[tracin_batch_start:tracin_batch_end]
                 val_tracin_scores = val_scores[tracin_batch_start:tracin_batch_end]
+
+                val_tracin_model_inputs = self.prepare_model_inputs(
+                    val_tracin_queries, val_tracin_responses
+                )
+                if self.is_distributed:
+                    val_tracin_model_inputs["input_ids"] = self.accelerator.pad_across_processes(
+                        val_tracin_model_inputs["input_ids"],
+                        dim=1,
+                        pad_index=self.tokenizer.pad_token_id,
+                        pad_first=pad_first_swv,
+                    )
+                    val_tracin_model_inputs["attention_mask"] = self.accelerator.pad_across_processes(
+                        val_tracin_model_inputs["attention_mask"],
+                        dim=1, pad_index=0, pad_first=pad_first_swv,
+                    )
                 
                 self._record_ghost = True
                 val_all_logprobs, val_logits_or_none, val_values, val_masks = self.batched_forward_pass(
@@ -2143,7 +2153,6 @@ class PPOTrainer(BaseTrainer):
         t = time.time()
 
         model_inputs = self.prepare_model_inputs(queries, responses)
-        val_model_inputs = self.prepare_model_inputs(val_queries, val_responses)
 
         if self.is_distributed:
             pad_first = self.tokenizer.padding_side == "left"
@@ -2153,13 +2162,6 @@ class PPOTrainer(BaseTrainer):
             )
             model_inputs["attention_mask"] = self.accelerator.pad_across_processes(
                 model_inputs["attention_mask"], dim=1, pad_index=0, pad_first=pad_first,
-            )
-            val_model_inputs["input_ids"] = self.accelerator.pad_across_processes(
-                val_model_inputs["input_ids"], dim=1,
-                pad_index=self.tokenizer.pad_token_id, pad_first=pad_first,
-            )
-            val_model_inputs["attention_mask"] = self.accelerator.pad_across_processes(
-                val_model_inputs["attention_mask"], dim=1, pad_index=0, pad_first=pad_first,
             )
 
         model_inputs_names = list(model_inputs.keys())
@@ -2375,13 +2377,18 @@ class PPOTrainer(BaseTrainer):
         t = time.time()
         val_S_A = {}   # {name: [r, d_in]}  averaged validation gradient (block A)
         val_S_B = {}   # {name: [d_out, r]}  averaged validation gradient (block B)
-        # Use actual val batch dim — must not index val with train's model_inputs keys alone
-        # (train tensors are batch_size-wide; mixing keys can yield dim0=bs and OOB for vb_inds≥bs).
-        n_val = int(val_model_inputs["input_ids"].shape[0])
-        val_input_keys = list(val_model_inputs.keys())
+        # Re-collate each validation chunk from (queries, responses). Slicing a single huge
+        # val_model_inputs dict can desync rows vs. list lengths and break attention / embeddings.
+        if not (len(val_queries) == len(val_responses) == len(val_scores)):
+            raise ValueError(
+                f"val length mismatch: queries={len(val_queries)} responses={len(val_responses)} "
+                f"scores={len(val_scores)}"
+            )
+        n_val = len(val_queries)
         M = n_val
 
         vb_chunk = self.config.tracin_val_batch_size
+        pad_first_val = self.tokenizer.padding_side == "left"
         for vb_start in range(0, n_val, vb_chunk):
             for buf in (self._xs, self._hs, self._gAs, self._gBs,
                         self._vxs, self._vgs, self._bgs):
@@ -2390,12 +2397,19 @@ class PPOTrainer(BaseTrainer):
 
             vb_end = min(vb_start + vb_chunk, n_val)
 
-            vb_inputs = {
-                k: val_model_inputs[k][vb_start:vb_end] for k in val_input_keys
-            }
             vb_queries = val_queries[vb_start:vb_end]
             vb_responses = val_responses[vb_start:vb_end]
             vb_scores = val_scores[vb_start:vb_end]
+
+            vb_inputs = self.prepare_model_inputs(vb_queries, vb_responses)
+            if self.is_distributed:
+                vb_inputs["input_ids"] = self.accelerator.pad_across_processes(
+                    vb_inputs["input_ids"], dim=1,
+                    pad_index=self.tokenizer.pad_token_id, pad_first=pad_first_val,
+                )
+                vb_inputs["attention_mask"] = self.accelerator.pad_across_processes(
+                    vb_inputs["attention_mask"], dim=1, pad_index=0, pad_first=pad_first_val,
+                )
 
             # Forward WITH hooks (captures xs, hs for validation)
             self._record_ghost = True
@@ -3817,6 +3831,18 @@ class PPOTrainer(BaseTrainer):
             input_kwargs = {key: value[i * fbs : (i + 1) * fbs] for key, value in model_inputs.items()}
             query_batch = queries[i * fbs : (i + 1) * fbs]
             response_batch = responses[i * fbs : (i + 1) * fbs]
+
+            if not self.is_encoder_decoder and "input_ids" in input_kwargs:
+                try:
+                    emb = model.get_input_embeddings()
+                    if emb is not None:
+                        vmax = emb.weight.shape[0] - 1
+                        input_kwargs["input_ids"] = input_kwargs["input_ids"].clamp(
+                            min=0, max=max(int(vmax), 0)
+                        )
+                except (AttributeError, NotImplementedError):
+                    pass
+
             logits, _, values = model(**input_kwargs)
 
             if self.is_encoder_decoder:
@@ -3830,17 +3856,24 @@ class PPOTrainer(BaseTrainer):
             masks = torch.zeros_like(attention_mask)
             masks[:, :-1] = attention_mask[:, 1:]
 
+            seq_len = int(attention_mask.shape[1])
             for j in range(len(query_batch)):
                 # print(j, query_batch[j], response_batch[j], attention_mask[j])
                 if self.is_encoder_decoder:
                     # Decoder sentence starts always in the index 1 after padding in the Enc-Dec Models
                     start = 1
-                    end = attention_mask[j, :].sum() - 1
+                    end = int(attention_mask[j, :].sum().item()) - 1
                 else:
-                    start = len(query_batch[j]) - 1
+                    start = int(len(query_batch[j]) - 1)
                     if attention_mask[j, 0] == 0:  # offset left padding
-                        start += attention_mask[j, :].nonzero()[0]
-                    end = start + len(response_batch[j])
+                        nz = attention_mask[j, :].nonzero(as_tuple=False).flatten()
+                        if nz.numel() > 0:
+                            start = start + int(nz[0].item())
+                    end = start + int(len(response_batch[j]))
+                    end = min(end, seq_len)
+                    start = max(0, min(start, seq_len - 1))
+                    if end <= start:
+                        end = min(start + 1, seq_len)
 
                 masks[j, :start] = 0
                 masks[j, end:] = 0
