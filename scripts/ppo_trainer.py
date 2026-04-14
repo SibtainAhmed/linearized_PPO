@@ -2189,9 +2189,11 @@ class PPOTrainer(BaseTrainer):
         timing["time/ppo/ghost_backward_base"] = 0.0
         timing["time/ppo/ghost_backward_ppo"] = 0.0
 
-        # Accumulators for Hessian (base/unweighted) gradient factors
+        # Separate accumulators for Hessian and PPO gradient factors
         hessian_gAs_accum = {}
         hessian_gBs_accum = {}
+        ppo_gAs_accum = {}
+        ppo_gBs_accum = {}
 
         # ==================================================================
         #  PHASE 1: Forward pass + TWO ghost backward passes for ALL N
@@ -2272,6 +2274,12 @@ class PPOTrainer(BaseTrainer):
             update_into_batch_dict(tb_dict, batch_dict)
 
             # --- Ghost backward #1: UNWEIGHTED log-prob (for Hessian h_i) ---
+            # Clear gAs/gBs BEFORE backward to avoid contamination from
+            # the previous iteration's PPO backward (#2).
+            for name in self._gAs:
+                self._gAs[name] = []
+                self._gBs[name] = []
+
             t = time.time()
             unweighted_loss = -(tb_logprobs.to(torch.float32) * tb_masks.detach().float()).sum()
             self._record_ghost = True
@@ -2312,14 +2320,22 @@ class PPOTrainer(BaseTrainer):
             self._record_ghost = False
             timing["time/ppo/ghost_backward_ppo"] += time.time() - t
 
+            # Save PPO gradient factors from this mini-batch
+            for name in self._gAs:
+                if name not in ppo_gAs_accum:
+                    ppo_gAs_accum[name] = []
+                    ppo_gBs_accum[name] = []
+                ppo_gAs_accum[name].extend(self._gAs[name])
+                ppo_gBs_accum[name].extend(self._gBs[name])
+
             t = time.time()
 
         # Consolidate training ghost factors  [N, S, d]
         t = time.time()
         train_xs = {k: torch.cat(v) for k, v in self._xs.items()}
         train_hs = {k: torch.cat(v) for k, v in self._hs.items()}
-        ppo_gAs = {k: torch.cat(v) for k, v in self._gAs.items()}
-        ppo_gBs = {k: torch.cat(v) for k, v in self._gBs.items()}
+        ppo_gAs = {k: torch.cat(v) for k, v in ppo_gAs_accum.items()}
+        ppo_gBs = {k: torch.cat(v) for k, v in ppo_gBs_accum.items()}
         hessian_gAs = {k: torch.cat(v) for k, v in hessian_gAs_accum.items()}
         hessian_gBs = {k: torch.cat(v) for k, v in hessian_gBs_accum.items()}
         timing["time/ppo/datainf_concat_train"] = time.time() - t
