@@ -78,7 +78,7 @@ elif "ultra" == script_args.dataset_name:
     dataset = build_ultra_promptdata(tokenizer)
 elif "imdb" in script_args.dataset_name:
     dataset = build_imdb_promptdata(tokenizer)
-    if script_args.with_validation or script_args.datainf:
+    if script_args.with_validation or script_args.datainf or script_args.datainf_identity:
         valid_dataset = build_imdb_promptdata(tokenizer, split='test', num_samples=script_args.val_size, seed=script_args.seed)
         val_question_tensors = valid_dataset['input_ids']
         val_questions = valid_dataset['query']
@@ -140,7 +140,15 @@ print(len(trainable_params))
 
 # TODO customize for different RM code, and different RM input formats
 # Run RL pipeline now
-if script_args.datainf:
+if script_args.datainf_identity:
+    print("NOTE: DataInf-Identity (plain dot-product / identity Hessian) training with validation dataset")
+    train_loop_with_validation(script_args, ppo_trainer, reward_model, tokenizer, rmformat,
+                               min_length=script_args.min_length,
+                               val_question_tensors=val_question_tensors,
+                               val_questions=val_questions,
+                               reward_tokenizer=reward_tokenizer,
+                               use_datainf_identity=True)
+elif script_args.datainf:
     print("NOTE: DataInf influence-based training with validation dataset")
     train_loop_with_validation(script_args, ppo_trainer, reward_model, tokenizer, rmformat,
                                min_length=script_args.min_length,

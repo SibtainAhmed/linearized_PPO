@@ -198,6 +198,12 @@ class PPOConfig(object):
         default=1e-8,
         metadata={"help": "Positivity buffer epsilon for the shift constant c in DataInf"},
     )
+    datainf_identity: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Use identity Hessian (H^{-1}=I, λ=1, no correction) instead of full DataInf. "
+                          "Reduces influence to a plain dot product v^T g_k^{PPO}, equivalent to IIF/TracIn. "
+                          "Use as a sanity-check / ablation to verify the DataInf implementation."},
+    )
 
     def __post_init__(self):
         if self.forward_batch_size is not None:

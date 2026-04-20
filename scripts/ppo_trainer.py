@@ -2704,6 +2704,560 @@ class PPOTrainer(BaseTrainer):
         return stats
 
     @PPODecorators.empty_cuda_cache()
+    def step_datainf_identity(
+        self,
+        queries: List[torch.LongTensor],
+        responses: List[torch.LongTensor],
+        scores: List[torch.FloatTensor],
+        val_queries: List[torch.LongTensor],
+        val_responses: List[torch.LongTensor],
+        val_scores: List[torch.FloatTensor],
+        timing: dict,
+        gen_data_dir: str,
+    ):
+        """
+        Identity-Hessian DataInf PPO step (ablation / sanity check).
+
+        Identical to step_datainf but replaces the DataInf Hessian inverse
+        with the identity matrix (λ=1, no Sherman-Morrison correction).
+        The influence formula reduces to a plain dot product:
+
+            I_identity(k) = sum_l  v_l^T g_k^{PPO}
+
+        This is structurally identical to the IIF/TracIn ghost dot product.
+        Use this as a verification: if DataInf machinery is correct,
+        results here should closely match step_with_validation (IIF).
+
+        Key differences from step_datainf:
+          - ONE ghost backward per mini-batch (PPO loss only).
+            The unweighted/Hessian ghost backward is removed entirely.
+          - Influence is a plain dot product (no Hessian correction term).
+          - Stats reported under 'ppo/datainf_identity/' prefix.
+        """
+        bs = self.config.batch_size
+
+        queries, responses, scores = self._step_safety_checker(
+            bs, queries, responses, scores
+        )
+        val_queries, val_responses, val_scores = self._step_safety_checker(
+            self.config.val_size, val_queries, val_responses, val_scores
+        )
+
+        if hasattr(self, "highest_reward"):
+            if self.compare_step % self.config.compare_steps == 0:
+                curr_mean_reward = torch.tensor(scores).mean()
+                if curr_mean_reward > self.highest_reward:
+                    self.highest_reward = curr_mean_reward
+                    self.push_to_hub(**self.push_to_hub_kwargs)
+            self.compare_step += 1
+
+        t0 = time.time()
+        t = time.time()
+
+        model_inputs = self.prepare_model_inputs(queries, responses)
+
+        if self.is_distributed:
+            pad_first = self.tokenizer.padding_side == "left"
+            model_inputs["input_ids"] = self.accelerator.pad_across_processes(
+                model_inputs["input_ids"], dim=1,
+                pad_index=self.tokenizer.pad_token_id, pad_first=pad_first,
+            )
+            model_inputs["attention_mask"] = self.accelerator.pad_across_processes(
+                model_inputs["attention_mask"], dim=1, pad_index=0, pad_first=pad_first,
+            )
+
+        model_inputs_names = list(model_inputs.keys())
+        full_kl_penalty = self.config.kl_penalty == "full"
+
+        self.model.eval()
+        for module in self.model.modules():
+            if isinstance(module, torch.nn.Dropout):
+                module.eval()
+
+        batch_dict = {}
+
+        def update_into_batch_dict(src, dst):
+            for k in src.keys():
+                if k not in dst:
+                    dst[k] = []
+                if isinstance(src[k], torch.Tensor):
+                    dst[k].append(src[k].detach())
+                else:
+                    dst[k].extend(src[k])
+
+        timing["time/ppo/forward_pass"] = 0.0
+        timing["time/ppo/compute_rewards"] = 0.0
+        timing["time/ppo/compute_advantages"] = 0.0
+        timing["time/ppo/ghost_backward_ppo"] = 0.0
+
+        # Only PPO gradient accumulators needed (no Hessian backward)
+        ppo_gAs_accum = {}
+        ppo_gBs_accum = {}
+
+        # ==================================================================
+        #  PHASE 1: Forward pass + ONE ghost backward (PPO loss) for all N
+        #  H^{-1} = I: no unweighted/Hessian backward needed.
+        # ==================================================================
+        for tb_start in range(0, bs, self.config.tracin_batch_size):
+            tb_end = tb_start + self.config.tracin_batch_size
+            tb_inds = np.arange(tb_start, tb_end)
+
+            tb_queries = [queries[i] for i in tb_inds]
+            tb_responses = [responses[i] for i in tb_inds]
+            tb_inputs = {k: model_inputs[k][tb_inds] for k in model_inputs_names}
+            tb_scores = [scores[i] for i in tb_inds]
+
+            # Forward pass WITH hooks → captures xs, hs
+            self._record_ghost = True
+            tb_logprobs, tb_logits, tb_values, tb_masks = self.batched_forward_pass(
+                self.model, tb_queries, tb_responses, tb_inputs,
+                return_logits=True,
+                batch_forward_batch_size=self.config.tracin_batch_size,
+            )
+            self._record_ghost = False
+
+            # Ref logprobs (no hooks, no grad)
+            with torch.no_grad():
+                if self.is_peft_model and hasattr(
+                    self.accelerator.unwrap_model(self.model).pretrained_model,
+                    "disable_adapter",
+                ):
+                    with self.accelerator.unwrap_model(self.model).pretrained_model.disable_adapter():
+                        tb_ref_logprobs, tb_ref_logits, _, _ = self.batched_forward_pass(
+                            self.model, tb_queries, tb_responses, tb_inputs,
+                            return_logits=full_kl_penalty,
+                            batch_forward_batch_size=self.config.tracin_batch_size,
+                        )
+                else:
+                    tb_ref_logprobs, tb_ref_logits, _, _ = self.batched_forward_pass(
+                        self.ref_model, tb_queries, tb_responses, tb_inputs,
+                        return_logits=full_kl_penalty,
+                        batch_forward_batch_size=self.config.tracin_batch_size,
+                    )
+            timing["time/ppo/forward_pass"] += time.time() - t
+
+            # Rewards & advantages (no grad)
+            with torch.no_grad():
+                t = time.time()
+                if full_kl_penalty:
+                    tb_active_full = logprobs_from_logits(tb_logits.detach(), None, gather=False)
+                    tb_ref_full = logprobs_from_logits(tb_ref_logits, None, gather=False)
+                    tb_rewards, tb_nsr = self.compute_rewards(
+                        tb_scores, tb_active_full, tb_ref_full, tb_masks.detach()
+                    )
+                else:
+                    tb_rewards, tb_nsr = self.compute_rewards(
+                        tb_scores, tb_logprobs.detach(), tb_ref_logprobs, tb_masks.detach()
+                    )
+                timing["time/ppo/compute_rewards"] += time.time() - t
+
+                t = time.time()
+                tb_values_upd, tb_advantages, tb_returns = self.compute_advantages(
+                    tb_values.detach(), tb_rewards, tb_masks.detach()
+                )
+                timing["time/ppo/compute_advantages"] += time.time() - t
+
+            tb_dict = {
+                "queries": tb_queries,
+                "responses": tb_responses,
+                "logprobs": tb_logprobs.to(torch.float32),
+                "ref_logprobs": tb_ref_logprobs.to(torch.float32),
+                "logits": tb_logits.to(torch.float32),
+                "values": tb_values_upd.to(torch.float32),
+                "masks": tb_masks,
+                "advantages": tb_advantages,
+                "returns": tb_returns,
+            }
+            tb_dict.update(tb_inputs)
+            update_into_batch_dict(tb_dict, batch_dict)
+
+            # Clear gAs/gBs before ghost backward to start fresh
+            for name in self._gAs:
+                self._gAs[name] = []
+                self._gBs[name] = []
+
+            # Ghost backward: FULL PPO loss → g_k^{PPO}
+            t = time.time()
+            self._record_ghost = True
+            with ghost_mode(self.optimizer):
+                self.train_minibatch(
+                    tb_logprobs.detach(),
+                    tb_values_upd.detach(),
+                    tb_logprobs,
+                    tb_logits,
+                    tb_values,
+                    tb_masks.detach(),
+                    tb_advantages,
+                    tb_returns,
+                )
+            self.optimizer.zero_grad()
+            self._record_ghost = False
+            timing["time/ppo/ghost_backward_ppo"] += time.time() - t
+
+            # Accumulate PPO gradient factors from this mini-batch
+            for name in self._gAs:
+                if name not in ppo_gAs_accum:
+                    ppo_gAs_accum[name] = []
+                    ppo_gBs_accum[name] = []
+                ppo_gAs_accum[name].extend(self._gAs[name])
+                ppo_gBs_accum[name].extend(self._gBs[name])
+
+            t = time.time()
+
+        # Consolidate training ghost factors  [N, S, d]
+        t = time.time()
+        train_xs = {k: torch.cat(v) for k, v in self._xs.items()}
+        train_hs = {k: torch.cat(v) for k, v in self._hs.items()}
+        ppo_gAs = {k: torch.cat(v) for k, v in ppo_gAs_accum.items()}
+        ppo_gBs = {k: torch.cat(v) for k, v in ppo_gBs_accum.items()}
+        timing["time/ppo/datainf_concat_train"] = time.time() - t
+
+        # Consolidate batch_dict
+        for k in batch_dict.keys():
+            if len(batch_dict[k]) < bs:
+                batch_dict[k] = torch.cat(batch_dict[k], dim=0)
+
+        # ==================================================================
+        #  PHASE 2: Effective weights w_i + percentile clipping
+        #  (same filtering as DataInf; keeps sample-quality filter intact)
+        # ==================================================================
+        t = time.time()
+        advantages = batch_dict["advantages"]   # [N, S]
+        masks = batch_dict["masks"]             # [N, S]
+
+        per_sample_adv = (
+            (advantages * masks).sum(dim=1) / masks.sum(dim=1).clamp(min=1)
+        )  # [N]
+
+        beta = self.kl_ctl.value
+        w = (per_sample_adv - beta) / bs   # [N]
+
+        p = self.config.datainf_percentile
+        Q_p = torch.quantile(w, p / 100.0)
+        c_shift = max(0.0, -Q_p.item()) + self.config.datainf_eps
+
+        retained_mask = w >= Q_p
+        retained_ids = torch.where(retained_mask)[0]
+        N_star = len(retained_ids)
+
+        print(f"[DataInf-Identity] N={bs}  N*={N_star}  "
+              f"Q_p={Q_p.item():.4e}  w∈[{w.min().item():.4e}, {w.max().item():.4e}]")
+
+        # Subset gradient factors to retained samples
+        ret_xs  = {k: v[retained_ids] for k, v in train_xs.items()}
+        ret_hs  = {k: v[retained_ids] for k, v in train_hs.items()}
+        ret_ppo_gAs = {k: v[retained_ids] for k, v in ppo_gAs.items()}
+        ret_ppo_gBs = {k: v[retained_ids] for k, v in ppo_gBs.items()}
+        del train_xs, train_hs, ppo_gAs, ppo_gBs
+
+        timing["time/ppo/datainf_weights"] = time.time() - t
+
+        # ==================================================================
+        #  PHASE 3: Validation ghost backward → accumulated val gradient
+        #  Same as DataInf/IIF: uses val_loss_type (e.g. seqloss-lastadv).
+        # ==================================================================
+        t = time.time()
+        val_S_A = {}
+        val_S_B = {}
+        if not (len(val_queries) == len(val_responses) == len(val_scores)):
+            raise ValueError(
+                f"val length mismatch: queries={len(val_queries)} "
+                f"responses={len(val_responses)} scores={len(val_scores)}"
+            )
+        n_val = len(val_queries)
+        M = n_val
+
+        vb_chunk = self.config.tracin_val_batch_size
+        pad_first_val = self.tokenizer.padding_side == "left"
+        for vb_start in range(0, n_val, vb_chunk):
+            for buf in (self._xs, self._hs, self._gAs, self._gBs,
+                        self._vxs, self._vgs, self._bgs):
+                for name in buf:
+                    buf[name] = []
+
+            vb_end = min(vb_start + vb_chunk, n_val)
+            vb_queries = val_queries[vb_start:vb_end]
+            vb_responses = val_responses[vb_start:vb_end]
+            vb_scores = val_scores[vb_start:vb_end]
+
+            vb_inputs = self.prepare_model_inputs(vb_queries, vb_responses)
+            if self.is_distributed:
+                vb_inputs["input_ids"] = self.accelerator.pad_across_processes(
+                    vb_inputs["input_ids"], dim=1,
+                    pad_index=self.tokenizer.pad_token_id, pad_first=pad_first_val,
+                )
+                vb_inputs["attention_mask"] = self.accelerator.pad_across_processes(
+                    vb_inputs["attention_mask"], dim=1, pad_index=0, pad_first=pad_first_val,
+                )
+
+            # Forward WITH hooks (captures xs, hs for validation)
+            self._record_ghost = True
+            vb_logprobs, vb_logits, vb_values, vb_masks = self.batched_forward_pass(
+                self.model, vb_queries, vb_responses, vb_inputs,
+                return_logits=True,
+                batch_forward_batch_size=self.config.tracin_val_batch_size,
+            )
+            self._record_ghost = False
+
+            # Ref logprobs for validation
+            with torch.no_grad():
+                with self.accelerator.unwrap_model(self.model).pretrained_model.disable_adapter():
+                    vb_ref_logprobs, vb_ref_logits, _, _ = self.batched_forward_pass(
+                        self.model, vb_queries, vb_responses, vb_inputs,
+                        return_logits=full_kl_penalty,
+                        batch_forward_batch_size=self.config.tracin_val_batch_size,
+                    )
+
+                if full_kl_penalty:
+                    vb_active_full = logprobs_from_logits(vb_logits.detach(), None, gather=False)
+                    vb_ref_full = logprobs_from_logits(vb_ref_logits, None, gather=False)
+                    vb_rewards, _ = self.compute_rewards(
+                        vb_scores, vb_active_full, vb_ref_full, vb_masks.detach()
+                    )
+                else:
+                    vb_rewards, _ = self.compute_rewards(
+                        vb_scores, vb_logprobs.detach(), vb_ref_logprobs, vb_masks.detach()
+                    )
+
+                _, vb_advantages, _ = self.compute_advantages(
+                    vb_values.detach(), vb_rewards, vb_masks.detach()
+                )
+
+            # Compute validation loss (identical to DataInf / IIF)
+            if self.config.val_loss_type == 'sample-level-orig':
+                masked_term = vb_advantages * vb_logprobs.to(torch.float32) * vb_masks.detach()
+                per_sample_num = vb_masks.sum(dim=1).clamp(min=1)
+                per_sample_sum = masked_term.sum(dim=1)
+                per_sample_loss = -per_sample_sum / per_sample_num
+                val_loss = per_sample_loss.mean()
+            elif self.config.val_loss_type == 'logprob':
+                masked_term = vb_logprobs.to(torch.float32) * vb_masks.detach()
+                per_sample_num = vb_masks.sum(dim=1).clamp(min=1)
+                per_sample_sum = masked_term.sum(dim=1)
+                per_sample_loss = -per_sample_sum / per_sample_num
+                val_loss = per_sample_loss.mean()
+            elif self.config.val_loss_type == 'rough-orig':
+                val_loss = -torch.mean(
+                    vb_advantages * vb_logprobs.to(torch.float32) * vb_masks.detach()
+                )
+            elif self.config.val_loss_type == 'seqloss-reward':
+                seq_logprob = (vb_logprobs.to(torch.float32) * vb_masks.detach()).sum(dim=1)
+                seq_score = torch.stack(vb_scores)
+                val_loss = (-seq_logprob * seq_score).mean()
+            elif self.config.val_loss_type == 'seqloss-lastadv':
+                seq_logprob = (vb_logprobs.to(torch.float32) * vb_masks.detach()).sum(dim=1)
+                m = vb_masks.detach()
+                indices = torch.argmax(m, dim=1) + torch.sum(m, dim=1) - 1
+                ali = vb_advantages.size(1)
+                indices = indices.clamp(min=0, max=max(ali - 1, 0))
+                seq_score = vb_advantages[
+                    torch.arange(vb_advantages.size(0), device=vb_advantages.device), indices
+                ]
+                val_loss = (-seq_logprob * seq_score).mean()
+            else:
+                raise NotImplementedError(
+                    f"Validation loss type {self.config.val_loss_type} not implemented."
+                )
+
+            print(f'[DataInf-Identity] val_loss ({self.config.val_loss_type}): {val_loss.item():.4f}')
+
+            # Ghost backward on validation loss (captures gAs, gBs)
+            self._record_ghost = True
+            self.accelerator.backward(val_loss)
+            self._record_ghost = False
+            self.optimizer.zero_grad()
+
+            # Accumulate averaged validation gradient per layer
+            for name in self._xs:
+                v_xs = torch.cat(self._xs[name]).to(torch.float32)
+                v_hs = torch.cat(self._hs[name]).to(torch.float32)
+                v_gAs = torch.cat(self._gAs[name]).to(torch.float32)
+                v_gBs = torch.cat(self._gBs[name]).to(torch.float32)
+
+                chunk_A = torch.matmul(v_gAs.transpose(1, 2), v_xs).sum(dim=0)
+                chunk_B = torch.matmul(v_gBs.transpose(1, 2), v_hs).sum(dim=0)
+
+                if name not in val_S_A:
+                    val_S_A[name] = chunk_A
+                    val_S_B[name] = chunk_B
+                else:
+                    val_S_A[name] += chunk_A
+                    val_S_B[name] += chunk_B
+
+        for name in val_S_A:
+            val_S_A[name] /= M
+            val_S_B[name] /= M
+
+        timing["time/ppo/datainf_val_ghost"] = time.time() - t
+
+        # ==================================================================
+        #  PHASE 4: Compute identity-Hessian influence scores
+        #           = plain dot product  sum_l v_l^T g_k^{PPO}
+        # ==================================================================
+        t = time.time()
+        ghost_ip = self.compute_identity_influence(
+            ret_xs, ret_hs, ret_ppo_gAs, ret_ppo_gBs, val_S_A, val_S_B, N_star,
+        )
+        timing["time/ppo/datainf_influence"] = time.time() - t
+        print("[DataInf-Identity] Influence scores:", ghost_ip[:10], "...")
+        del ret_xs, ret_hs, ret_ppo_gAs, ret_ppo_gBs
+
+        # ==================================================================
+        #  PHASE 5: Save & filter
+        # ==================================================================
+        os.makedirs(gen_data_dir, exist_ok=True)
+        torch.save({
+            "queries": queries,
+            "responses": responses,
+            "scores": scores,
+            "ip_scores": ghost_ip,
+            "w": w.cpu().numpy(),
+            "retained_ids": retained_ids.cpu().numpy(),
+            "kl_ctl_value": self.kl_ctl.value,
+        }, f'{gen_data_dir}/datainf_identity_scores_{self.save_cnt}.pt')
+        self.save_cnt += 1
+
+        # Map influence scores back to full-batch indices
+        full_ip = np.full(bs, -np.inf)
+        for local_idx, global_idx in enumerate(retained_ids.cpu().numpy()):
+            full_ip[global_idx] = ghost_ip[local_idx]
+
+        t = time.time()
+        selected_ids = np.where(full_ip > 0)[0]
+        print(f"[DataInf-Identity] #selected={len(selected_ids)} / {bs}")
+
+        if self.config.log_with == "wandb":
+            import wandb
+            wandb.log({
+                "influence/n_selected": float(len(selected_ids)),
+                "influence/n_total": float(bs),
+                "influence/selection_ratio": float(len(selected_ids)) / float(bs),
+                "influence/n_retained": float(N_star),
+            })
+
+        # ==================================================================
+        #  PHASE 6: PPO optimisation on selected samples
+        # ==================================================================
+        sel_bs = len(selected_ids)
+        all_stats = []
+        early_stop = False
+        for _ in range(self.config.ppo_epochs):
+            if early_stop:
+                break
+            b_inds = np.random.permutation(selected_ids)
+
+            for bw_start in range(0, sel_bs, self.config.backward_batch_size):
+                bw_end = bw_start + self.config.backward_batch_size
+                if bw_end > sel_bs:
+                    break
+                bw_inds = b_inds[bw_start:bw_end]
+
+                for mb_start in range(0, self.config.backward_batch_size,
+                                      self.config.mini_batch_size):
+                    mb_end = mb_start + self.config.mini_batch_size
+                    mb_inds = bw_inds[mb_start:mb_end]
+                    mb_dict = {
+                        "logprobs": batch_dict["logprobs"][mb_inds],
+                        "values": batch_dict["values"][mb_inds],
+                        "masks": batch_dict["masks"][mb_inds],
+                        "queries": [batch_dict["queries"][i] for i in mb_inds],
+                        "responses": [batch_dict["responses"][i] for i in mb_inds],
+                        "advantages": batch_dict["advantages"][mb_inds],
+                        "returns": batch_dict["returns"][mb_inds],
+                    }
+                    for k in model_inputs_names:
+                        mb_dict[k] = batch_dict[k][mb_inds]
+
+                    with self.accelerator.accumulate(self.model):
+                        model_inputs_mb = {k: mb_dict[k] for k in model_inputs_names}
+                        logprobs, logits, vpreds, _ = self.batched_forward_pass(
+                            self.model,
+                            mb_dict["queries"],
+                            mb_dict["responses"],
+                            model_inputs_mb,
+                            return_logits=True,
+                            batch_forward_batch_size=min(
+                                self.config.mini_batch_size,
+                                self.config.tracin_batch_size,
+                            ),
+                        )
+                        train_stats = self.train_minibatch(
+                            mb_dict["logprobs"].detach(),
+                            mb_dict["values"].detach(),
+                            logprobs, logits, vpreds,
+                            mb_dict["masks"].detach(),
+                            mb_dict["advantages"],
+                            mb_dict["returns"],
+                        )
+                        all_stats.append(train_stats)
+
+            if self.config.early_stopping:
+                policykl = train_stats["policy/policykl"]
+                early_stop = self._early_stop(policykl)
+                if early_stop:
+                    break
+
+        timing["time/ppo/optimize_step"] = time.time() - t
+
+        # ==================================================================
+        #  Stats & cleanup
+        # ==================================================================
+        t = time.time()
+        train_stats = stack_dicts(all_stats)
+        train_stats["policy/advantages"] = torch.flatten(
+            train_stats["policy/advantages"]
+        ).unsqueeze(0)
+        train_stats["policy/advantages"] = torch.nan_to_num(
+            train_stats["policy/advantages"], WANDB_PADDING
+        )
+        train_stats["policy/ratio"] = torch.flatten(
+            train_stats["policy/ratio"]
+        ).unsqueeze(0)
+
+        stats = self.record_step_stats(
+            scores=scores,
+            logprobs=batch_dict["logprobs"],
+            ref_logprobs=batch_dict["ref_logprobs"],
+            train_stats=train_stats,
+            kl_coef=self.kl_ctl.value,
+            masks=batch_dict["masks"],
+            queries=queries,
+            responses=responses,
+        )
+        if self.is_distributed:
+            stats = self.gather_stats(stats)
+        stats = stats_to_np(stats)
+        timing["time/ppo/calc_stats"] = time.time() - t
+
+        stats["ppo/learning_rate"] = self.optimizer.param_groups[0]["lr"]
+        stats["ppo/datainf_identity/n_selected"] = len(selected_ids)
+        stats["ppo/datainf_identity/n_total"] = bs
+        stats["ppo/datainf_identity/selection_ratio"] = len(selected_ids) / bs
+        stats["ppo/datainf_identity/n_retained"] = N_star
+
+        self.kl_ctl.update(
+            stats["objective/kl"],
+            self.config.batch_size * self.accelerator.num_processes,
+        )
+
+        timing["time/ppo/total"] = time.time() - t0
+        stats.update(timing)
+
+        if self.config.log_with != "wandb":
+            stats = convert_to_scalar(stats)
+
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()
+
+        for buf in (self._xs, self._hs, self._gAs, self._gBs,
+                    self._vxs, self._vgs, self._bgs):
+            for name in buf:
+                buf[name] = []
+        torch.cuda.empty_cache()
+
+        return stats
+
+    @PPODecorators.empty_cuda_cache()
     def diagnose_with_validation(
         self,
         queries: List[torch.LongTensor],
@@ -3724,6 +4278,44 @@ class PPOTrainer(BaseTrainer):
             # I_l(k) = -(1/λ) [v^T g_k^{PPO} - correction_k / N*]
             influence_l = (-1.0 / lambda_l) * (val_ppo_ip - correction / N_star)
             influence += influence_l
+
+        return [x.item() for x in influence]
+
+    def compute_identity_influence(self, train_xs, train_hs, ppo_gAs, ppo_gBs,
+                                   val_S_A, val_S_B, N_star):
+        """
+        Identity-Hessian influence: plain dot product v_l^T g_k^{PPO}, summed over layers.
+
+        Setting H_l^{-1} = I and λ=1 in the DataInf formula (Eq. 12) eliminates
+        the Sherman-Morrison correction, leaving:
+
+            I_identity(k) = sum_l  v_l^T g_k^{PPO}
+
+        Sign convention: positive = helpful (gradient aligns with validation
+        direction), consistent with IIF/TracIn's 'positive = keep' criterion.
+
+        Note: the formal derivation gives I = -v^T H^{-1} g = -v^T g with the
+        identity; the sign is flipped here so that selection by 'influence > 0'
+        directly matches IIF's selection criterion.
+        """
+        device = next(iter(ppo_gAs.values())).device
+        influence = torch.zeros(N_star, device=device, dtype=torch.float32)
+
+        for name in train_xs:
+            xs = train_xs[name].to(torch.float32)
+            hs = train_hs[name].to(torch.float32)
+            p_gAs = ppo_gAs[name].to(torch.float32)
+            p_gBs = ppo_gBs[name].to(torch.float32)
+
+            ppo_P_A = torch.matmul(p_gAs.transpose(1, 2), xs)    # [N*, r, d_in]
+            ppo_P_B = torch.matmul(p_gBs.transpose(1, 2), hs)    # [N*, d_out, r]
+
+            v_A = val_S_A[name].to(torch.float32)
+            v_B = val_S_B[name].to(torch.float32)
+
+            # v_l^T g_k^{PPO} — plain inner product per retained sample
+            val_ppo_ip = (ppo_P_A * v_A).sum(dim=(1, 2)) + (ppo_P_B * v_B).sum(dim=(1, 2))
+            influence += val_ppo_ip
 
         return [x.item() for x in influence]
 

@@ -145,6 +145,7 @@ class ScriptArguments:
     datainf_damping_scale: Optional[float] = field(default=1.0, metadata={"help": "c_lambda for DataInf adaptive damping"})
     datainf_percentile: Optional[float] = field(default=2.0, metadata={"help": "percentile p for DataInf weight clipping"})
     datainf_eps: Optional[float] = field(default=1e-8, metadata={"help": "epsilon for DataInf shift constant positivity"})
+    datainf_identity: Optional[bool] = field(default=False, metadata={"help": "ablation: use identity Hessian (plain dot product) instead of full DataInf"})
 
 DEFAULT_PAD_TOKEN = "[PAD]"
 DEFAULT_EOS_TOKEN = "</s>"
@@ -256,6 +257,7 @@ def load_models(script_args, loadms="rmppo", dev=0):
             datainf_damping_scale=script_args.datainf_damping_scale,
             datainf_percentile=script_args.datainf_percentile,
             datainf_eps=script_args.datainf_eps,
+            datainf_identity=script_args.datainf_identity,
         )
         model = AutoModelForCausalLMWithValueHead.from_pretrained(
             script_args.model_name,
@@ -354,6 +356,7 @@ def load_model_with_adapter(script_args):
         datainf_damping_scale=script_args.datainf_damping_scale,
         datainf_percentile=script_args.datainf_percentile,
         datainf_eps=script_args.datainf_eps,
+        datainf_identity=script_args.datainf_identity,
     )
 
     model = AutoModelForCausalLMWithValueHead.from_pretrained(
@@ -1264,7 +1267,7 @@ def train_loop_one_step(script_args, ppo_trainer, reward_model, tokenizer, qafor
         if script_args.save_freq and (epoch+1) % script_args.save_freq == 0:
             ppo_trainer.save_pretrained(script_args.output_dir + f"step_{epoch+1}")
 
-def train_loop_with_validation(script_args, ppo_trainer, reward_model, tokenizer, qaform, min_length=20, val_question_tensors=None, val_questions=None, reward_tokenizer=None, use_datainf=False):
+def train_loop_with_validation(script_args, ppo_trainer, reward_model, tokenizer, qaform, min_length=20, val_question_tensors=None, val_questions=None, reward_tokenizer=None, use_datainf=False, use_datainf_identity=False):
     
     # global likemod, liketok, slikemod, sliketok
     
@@ -1550,7 +1553,11 @@ def train_loop_with_validation(script_args, ppo_trainer, reward_model, tokenizer
             # TODO need to tune the scaling stuff a little bit
             rewards = [rewards[i]+bonuses[i] for i in range(len(rewards))]
                    
-        if use_datainf:
+        if use_datainf_identity:
+            stats = ppo_trainer.step_datainf_identity(question_tensors, response_tensors, rewards,
+                                                      val_question_tensors, val_response_tensors, val_rewards,
+                                                      timing, gen_data_dir=script_args.gen_data_dir)
+        elif use_datainf:
             stats = ppo_trainer.step_datainf(question_tensors, response_tensors, rewards,
                                              val_question_tensors, val_response_tensors, val_rewards,
                                              timing, gen_data_dir=script_args.gen_data_dir)
