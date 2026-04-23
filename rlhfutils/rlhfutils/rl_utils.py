@@ -75,6 +75,10 @@ class ScriptArguments:
     early_stopping: Optional[bool] = field(default=False, metadata={"help": "whether to early stop"})
     save_rollouts: Optional[bool] = field(default=False, metadata={"help": "save rollouts, rewards to file"})
     target_kl: Optional[float] = field(default=0.1, metadata={"help": "kl target for early stopping"})
+    ratio_threshold: Optional[float] = field(
+        default=10.0,
+        metadata={"help": "Skip PPO minibatches whose average ratio is above this threshold"},
+    )
     sanity_check: Optional[bool] = field(default=False, metadata={"help": "whether to do a sanity check"})
     tracin: Optional[bool] = field(default=False, metadata={"help": "whether to use tracin for reselection"})
     load_in_8bit: Optional[bool] = field(default=False, metadata={"help": "whether to load in 8 bit"})
@@ -238,6 +242,7 @@ def load_models(script_args, loadms="rmppo", dev=0):
             # optimize_device_cache="dpoplus" not in script_args.kl_penalty,
             early_stopping=script_args.early_stopping,
             target_kl=script_args.target_kl,
+            ratio_threshold=script_args.ratio_threshold,
             ppo_epochs=script_args.ppo_epochs,
             seed=script_args.seed,
             cliprange=0.2,
@@ -337,6 +342,7 @@ def load_model_with_adapter(script_args):
         # optimize_device_cache="dpoplus" not in script_args.kl_penalty,
         early_stopping=script_args.early_stopping,
         target_kl=script_args.target_kl,
+        ratio_threshold=script_args.ratio_threshold,
         ppo_epochs=script_args.ppo_epochs,
         seed=script_args.seed,
         cliprange=0.2,

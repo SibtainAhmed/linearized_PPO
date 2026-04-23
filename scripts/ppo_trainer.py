@@ -338,6 +338,7 @@ class PPOTrainer(BaseTrainer):
 
         # init the current step
         self.current_step = 0
+        self._train_start_time = time.time()
 
         # init variables for pushing model to hub
         if config.push_to_hub_if_best_kwargs:
@@ -2486,7 +2487,7 @@ class PPOTrainer(BaseTrainer):
                 val_loss = (-seq_logprob * seq_score).mean()
 
             elif self.config.val_loss_type == 'seqloss-lastadv':
-                seq_logprob = (vb_logprobs.to(torch.float32) * vb_masks.detach()).sum(dim=1)
+                seq_logprob = (vb_logprobs.to(torch.float32) * vb_masks.detach()).sum(dim=1) # why summing over dimension 1?
                 m = vb_masks.detach()
                 indices = torch.argmax(m, dim=1) + torch.sum(m, dim=1) - 1
                 ali = vb_advantages.size(1)
@@ -4308,6 +4309,7 @@ class PPOTrainer(BaseTrainer):
             logs["env/reward_mean"] = torch.mean(rewards).cpu().numpy().item()
             logs["env/reward_std"] = torch.std(rewards).cpu().numpy().item()
             logs["env/reward_dist"] = rewards.cpu().numpy()
+            logs["env/iteration_over_time"] = time.time() - self._train_start_time
 
             logs["env/reward_mean"] = torch.mean(rewards).cpu().numpy().item()
             logs["env/reward_std"] = torch.std(rewards).cpu().numpy().item()

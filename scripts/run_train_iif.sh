@@ -24,6 +24,7 @@ accelerate launch --main_process_port=29524 \
     --init_kl_coef=0.04 --steps=200 \
     --min_length=20 \
     --wandb_project="ppo-detox" \
+    --ratio_threshold=10.0 \
     --run_name="tracin-2.7b-bfloat16-kl-0.04-val-1024_tgt-seqloss-lastadv_mbs-1_seed-22" \
     --tracin \
     --with_validation \
