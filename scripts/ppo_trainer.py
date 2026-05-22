@@ -4312,7 +4312,7 @@ class PPOTrainer(BaseTrainer):
             correction = alpha @ cross_gram   # [N*]
 
             # I_l(k) = -(1/λ) [v^T g_k^{PPO} - correction_k / N*]
-            influence_l = (-1.0 / lambda_l) * (val_ppo_ip - correction / N_star)
+            influence_l = (-1.0 / lambda_l) * (w_plus_c * val_ppo_ip - correction / N_star)
             # influence_l = (1.0) * (val_ppo_ip)
             influence += influence_l
 
