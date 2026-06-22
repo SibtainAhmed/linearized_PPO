@@ -16,7 +16,6 @@ accelerate launch --main_process_port=29522 \
     --seed=22 \
     --max_length=30 \
     --gen_bsize=256 \
-    --ratio_threshold=5.0 \
     --val_size=1024 \
     --learning_rate=1e-5 \
     --early_stopping=False \
